@@ -19,13 +19,13 @@ basename  = HB3       # problem ID: basename of output filenames
 
 <mesh>
 nghost     = 3              # Number of ghost cells
-nx1        = 2048           # Number of zones in X1-direction
+nx1        = 512            # Number of zones in X1-direction
 x1min      = -0.5           # minimum value of X1
 x1max      = 0.5            # maximum value of X1
 ix1_bc     = shear_periodic # Inner-X1 boundary condition flag
 ox1_bc     = shear_periodic # Outer-X1 boundary condition flag
 
-nx2        = 2048           # Number of zones in X2-direction
+nx2        = 512            # Number of zones in X2-direction
 x2min      = -0.5           # minimum value of X2
 x2max      = 0.5            # maximum value of X2
 ix2_bc     = periodic       # Inner-X2 boundary condition flag

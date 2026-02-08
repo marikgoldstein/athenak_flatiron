@@ -55,5 +55,24 @@ index 3947cdee..627e9b95 100644
 # run build.sh
 
 # step 5: test 
-use the launch.sbatch here with the sample mri2d input file
+use the launch.sbatch or run.sh here with the sample mri2d input files
+
+
+# notes
+
+
+
+if you encounter
+```
+### FATAL ERROR in /mnt/home/mgoldstein/athenak_flatiron/athenak/src/pgen/pgen.cpp at line 75
+User history output specified in <problem> block, but not enrolled by UserProblem().
+Kokkos::Cuda ERROR: Failed to call Kokkos::Cuda::finalize()
+```
+then set this line
+```
+user_hist          = true  # enroll user-defined history function                                         
+```
+to false and try again.
+
+Also, for testing, set nx1,nx2 to small numbers in the mesh and meshblock sections of the input deck.
 

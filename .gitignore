@@ -14,6 +14,8 @@
 athenak
 build_mri2d
 
+mesh_structure.dat
+
 __pycache__
 wandb
 

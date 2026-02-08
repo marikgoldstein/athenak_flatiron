@@ -14,9 +14,9 @@
 #SBATCH --exclude=workergpu027,workergpu047
 
 # --constraint="h100|a100-80gb"
-EXE="/mnt/home/mgoldstein/build_athenak/src/athena"
+EXE="/mnt/home/mgoldstein/athenak_flatiron/build_mri2d/src/athena"
 LD="/mnt/sw/fi/cephtweaks/lib/libcephtweaks.so"
-DECK="/mnt/home/mgoldstein/run_athenak/mri2d.athinput.2048"
+DECK="/mnt/home/mgoldstein/athenak_flatiron/mri2d.athinput.2048"
 OUT="/mnt/home/mgoldstein/ceph/athenak/"
 set -euo pipefail
 module purge
@@ -28,7 +28,7 @@ export CEPHTWEAKS_LAZYIO=1
 
 srun --cpus-per-task=$SLURM_CPUS_PER_TASK --cpu-bind=cores --gpu-bind=single:2 \
   bash -c "unset CUDA_VISIBLE_DEVICES; \
-  ${EXE} -i ${DECK} -d ${OUT} -m"
+  ${EXE} -i ${DECK} -d ${OUT}"
 
 #Notes
 #There are 4 GPUs per node, 

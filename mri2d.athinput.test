@@ -15,17 +15,20 @@ basename  = HB3       # problem ID: basename of output filenames
 # MESH, TIME-STEPPING, ALGORITHMS                              #
 ################################################################
 
+# nx1 and nx2 were 2048 but currently 512 
+#PS: I changed nx1 and nx2 to 512 in the <mesh> section in the input deck (cell number along x and y) to make it cheaper to test.
+
 
 
 <mesh>
 nghost     = 3              # Number of ghost cells
-nx1        = 2048           # Number of zones in X1-direction
+nx1        = 4           # Number of zones in X1-direction
 x1min      = -0.5           # minimum value of X1
 x1max      = 0.5            # maximum value of X1
 ix1_bc     = shear_periodic # Inner-X1 boundary condition flag
 ox1_bc     = shear_periodic # Outer-X1 boundary condition flag
 
-nx2        = 2048           # Number of zones in X2-direction
+nx2        = 4           # Number of zones in X2-direction
 x2min      = -0.5           # minimum value of X2
 x2max      = 0.5            # maximum value of X2
 ix2_bc     = periodic       # Inner-X2 boundary condition flag
@@ -38,8 +41,8 @@ ix3_bc     = periodic       # Inner-X3 boundary condition flag
 ox3_bc     = periodic       # Outer-X3 boundary condition flag
 
 <meshblock>
-nx1        = 256            # Number of cells in each MeshBlock, X1-dir
-nx2        = 256            # Number of cells in each MeshBlock, X2-dir
+nx1        = 4            # Number of cells in each MeshBlock, X1-dir
+nx2        = 4            # Number of cells in each MeshBlock, X2-dir
 nx3        = 1              # Number of cells in each MeshBlock, X3-dir
 
 <time>
