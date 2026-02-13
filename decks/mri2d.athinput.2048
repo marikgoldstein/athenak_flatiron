@@ -59,8 +59,8 @@ reconstruct       = ppm4       # spatial reconstruction method
 rsolver           = hlld       # Riemann-solver to be used
 eos               = isothermal # EOS type
 iso_sound_speed   = 1.0
-ohmic_resistivity = 1.0e-4
-viscosity         = 1.0e-4
+ohmic_resistivity = 1.0e-4   # 1.0e-4
+viscosity         = 1.0e-4	 # 1.0e-4
 
 # dedicated shearing box sections available in newer athenak in the main branch
 <shearing_box>
