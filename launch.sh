@@ -11,7 +11,6 @@ module load slurm cuda openmpi/cuda-4.1.8
 export LD_PRELOAD=${LD}
 export CEPHTWEAKS_LAZYIO=1
 
-
 # Run with 4 MPI ranks, one per GPU
 mpirun -np 4 \
     --bind-to core \
