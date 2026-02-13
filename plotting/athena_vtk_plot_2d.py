@@ -11,7 +11,7 @@ import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 
-from athena_vtk_lib import read_athenak_vtk
+from mylib import read_athenak_vtk
 
 ##################################
 # PARSING COMMAND LINE ARGUMENTS #
@@ -71,7 +71,7 @@ def main(args):
 
     if fieldname in data:
 
-
+        print("found data in filename", filename)
 
         field_data = data[fieldname]
 
@@ -118,7 +118,7 @@ def main(args):
             plt.savefig(args.imagename, bbox_inches="tight", dpi=320)
 
     else:
-        print("SKIP")
+        print("SKIP: did not find data in filename", filename)
 
 if __name__ == '__main__':
 
@@ -148,12 +148,18 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    for name in ['mhd_bcc', 'mhd_jz', 'mhd_w']:
-        for num in ['00000', '00001', '00002', '00003', '00004']:
+    #for name in ['mhd_bcc', 'mhd_jz', 'mhd_w']:
+    for name in ['mhd_bcc']:
+        #for num in ['00000', '00001', '00002', '00003', '00004', '00005', '00006', '00007', '00008']:
+        for num in ['00000']:
+
+
             fname = f'HB3.{name}.{num}.vtk'
             path=f"/mnt/home/mgoldstein/ceph/athenak/vtk/{fname}"
             args.filename = path
-            args.fieldname = 'velx'
+            args.fieldname = 'bcc1' #'velx'
+            #- The mhd_bcc files contain fields named bcc1, bcc2, bcc3
+            #- The mhd_jz files contain a field named jz
             main(args=args)
 
 
