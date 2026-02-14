@@ -48,7 +48,7 @@ integrator = rk3            # time integration algorithm
 cfl_number = 0.4            # The Courant, Friedrichs, & Lewy (CFL) Number
 nlim       = -1             # cycle limit
 tlim       = 628.31854      # time limit
-ndiag      = 1              # cycles between diagostic output
+ndiag      = 100            # cycles between diagostic output
 
 ################################################################
 # PHYSICS                                                      #
@@ -90,20 +90,24 @@ dt          = 0.0062831853 # time increment between outputs
 data_format = %12.5e       # Optional data format string
 
 <output2>
-file_type   = vtk          # Binary data dump
+file_type   = bin          # Binary data dump (POSIX I/O, avoids MPI-IO Ceph hang)
 variable    = mhd_w        # variables to be output
 dt          = 0.62831853   # time increment between outputs
+single_file_per_rank = true
 
 <output3>
-file_type   = vtk          # Binary data dump
+file_type   = bin          # Binary data dump
 variable    = mhd_bcc      # variables to be output
 dt          = 0.62831853   # time increment between outputs
+single_file_per_rank = true
 
 <output4>
-file_type   = vtk          # Binary data dump
+file_type   = bin          # Binary data dump
 variable    = mhd_jz       # variables to be output
 dt          = 0.62831853   # time increment between outputs
+single_file_per_rank = true
 
 <output5>
-file_type   = rst          # Binary data dump
+file_type   = rst          # Restart dump
 dt          = 6.2831853    # time increment between outputs
+single_file_per_rank = true

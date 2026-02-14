@@ -12,19 +12,20 @@
 #SBATCH --error=logs/%x_%A_%a.err
 #SBATCH --job-name=athenak
 #SBATCH --exclude=workergpu027,workergpu047
+#SBATCH --mem=100G
 
 cd /mnt/home/mgoldstein/athenak_flatiron
 EXE="/mnt/home/mgoldstein/athenak_flatiron/build_mri2d/src/athena"
-LD="/mnt/sw/fi/cephtweaks/lib/libcephtweaks.so"
 DECK="/mnt/home/mgoldstein/athenak_flatiron/decks/mri2d.athinput.2048"
+OUT="/mnt/home/mgoldstein/ceph/athenak/feb13/"
+set -euo pipefail
 
-OUT="/mnt/home/mgoldstein/ceph/athenak/feb13_res2048/"
-set -euo pipefail                                                                                                 
 module purge
-module load slurm cuda openmpi
-export LD_PRELOAD=${LD}
+module load slurm gcc cuda openmpi/cuda-4.1.8
+
+export LD_PRELOAD=/mnt/sw/fi/cephtweaks/lib/libcephtweaks.so
 export CEPHTWEAKS_LAZYIO=1
 
-srun --cpus-per-task=$SLURM_CPUS_PER_TASK --cpu-bind=cores \
+srun --cpus-per-task=${SLURM_CPUS_PER_TASK:-16} --cpu-bind=cores \
   bash -c "unset CUDA_VISIBLE_DEVICES; \
   ${EXE} -i ${DECK} -d ${OUT}"

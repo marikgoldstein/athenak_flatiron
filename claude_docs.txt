@@ -1,0 +1,110 @@
+AthenaK on Flatiron Rusty (A100 GPUs) — Notes
+==============================================
+Date: 2026-02-13
+
+CURRENT SETUP
+-------------
+Scripts:
+  get4gpus.sh  — salloc to get 4 A100s interactively
+  build.sh     — cmake + make (uses A_FLAGS for Ampere80)
+  launch.sh    — srun launch for interactive use (within salloc)
+  launch.sbatch — sbatch version for batch submission
+  load.sh      — unrelated, loads python env for gameflow
+
+Modules (must match between build and run):
+  slurm gcc cuda openmpi/cuda-4.1.8
+
+Input deck: decks/mri2d.athinput.2048
+  2048x2048x1 mesh, 256x256x1 meshblocks (64 blocks, 16 per GPU)
+  Isothermal MHD shearing box, MRI problem
+  tlim = 628.31854 (100 orbits), ndiag = 100
+
+Output to: /mnt/home/mgoldstein/ceph/athenak/feb13_test_fresh/
+
+PROBLEM WE HIT & ROOT CAUSE
+----------------------------
+Simulation hung on 4 GPUs with 0% GPU utilization. Worked on 1 GPU and on 4
+GPUs writing to /tmp.
+
+Root cause: AthenaK's VTK output uses MPI-IO (MPI_File_open, MPI_File_write_all).
+MPI-IO writes to Ceph hang in the kernel function `request_wait_answer` (waits
+for Ceph OSD response). One rank blocks on I/O, the other 3 spin-wait in MPI
+collectives — deadlock.
+
+Diagnosis method:
+  - nvidia-smi: all 4 GPUs allocated memory but 0% utilization
+  - top: 3 ranks ~100% CPU (MPI spin-wait), 1 rank sleeping
+  - /proc/<pid>/wchan: sleeping rank showed `request_wait_answer` (Ceph kernel)
+  - /proc/<pid>/fd/: stuck rank had VTK file open on Ceph
+  - Writing to /tmp confirmed hang was Ceph-specific
+
+Things that DID NOT fix it:
+  - cephtweaks: only intercepts POSIX open(), not MPI_File_open()
+  - OMPI_MCA_fs_ufs_lock_algorithm=0: disabling ROMIO fcntl locking
+  - OMPI_MCA_io=ompio: OpenMPI native MPI-IO (slightly better but still hung)
+  - Fresh output directory
+  - --gpu-bind=single:2 (from IAS wiki, may be for older SLURM)
+
+THE FIX
+-------
+Switch output from `vtk` to `bin` with `single_file_per_rank = true` in the
+input deck. Each rank writes its own file via POSIX fwrite(), bypassing MPI-IO.
+
+Applied to all bin outputs (output2-4) and restart (output5).
+
+Launch script still includes cephtweaks for remaining POSIX I/O (hst files).
+`unset CUDA_VISIBLE_DEVICES` must be inside `bash -c` (not before srun)
+because SLURM re-sets it per task. Kokkos auto-selects GPUs by local MPI rank.
+
+READING BIN OUTPUT FILES
+------------------------
+AthenaK ships with vis/python/bin_convert.py for reading and converting.
+
+Per-rank files are written to directories like:
+  <outdir>/bin/rank_00000000/HB3.mhd_w.00000.bin
+  <outdir>/bin/rank_00000001/HB3.mhd_w.00000.bin
+  ...
+
+Python usage:
+
+  import sys
+  sys.path.insert(0, '/mnt/home/mgoldstein/athenak_flatiron/athenak/vis/python')
+  import bin_convert
+
+  # Read and combine all per-rank files into one dict
+  filedata = bin_convert.read_all_ranks_binary(
+      'path/to/rank_00000000/HB3.mhd_w.00000.bin'
+  )
+
+  # Access data as numpy arrays
+  filedata['time']                    # simulation time
+  filedata['cycle']                   # cycle number
+  filedata['var_names']               # e.g. ['dens', 'velx', 'vely', 'velz', 'eint']
+  filedata['mb_data']['dens']         # density array (n_meshblocks, nx3, nx2, nx1)
+  filedata['mb_geometry']             # meshblock coordinates
+  filedata['n_mbs']                   # total number of meshblocks
+  filedata['Nx1'], filedata['Nx2']    # root grid dimensions
+
+  # Convert to athdf + xdmf for ParaView/VisIt
+  bin_convert.write_athdf('output.athdf', filedata)
+  bin_convert.write_xdmf_for('output.athdf.xdmf', 'output.athdf', filedata)
+
+CEPHTWEAKS
+----------
+Library: /mnt/sw/fi/cephtweaks/lib/libcephtweaks.so (by apataki@flatiron)
+LD_PRELOAD that intercepts open/fopen and calls ceph_lazyio ioctl. Tells the
+Ceph kernel client to skip distributed coherence (buffer writes, flush async).
+Helps: POSIX I/O to Ceph. Safe for single-writer workloads.
+Does NOT help: MPI-IO (MPI_File_open) — which was our VTK hang.
+Admin note: can cause data corruption with multiple writers; masks Ceph issues.
+
+REFERENCE
+---------
+IAS wiki: https://github.com/IAS-Astrophysics/athenak/wiki/Notes-for-Specific-Machines
+
+Key source files:
+  athenak/src/outputs/vtk_mesh.cpp   — VTK output (MPI-IO, no single_file_per_rank)
+  athenak/src/outputs/binary.cpp     — bin output (supports single_file_per_rank)
+  athenak/src/outputs/io_wrapper.cpp — I/O abstraction (MPI-IO vs POSIX switch)
+  athenak/src/outputs/restart.cpp    — restart output (supports single_file_per_rank)
+  athenak/vis/python/bin_convert.py  — Python reader/converter for bin files
