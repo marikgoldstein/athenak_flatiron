@@ -1,0 +1,13 @@
+   [mhd_jz/jz] frame 0050/50
+  Running: ffmpeg -y -framerate 30 -i /tmp/video_mhd_jz_jz_xi7dhg1e/frame_%05d.png -c:v libx264 -pix_fmt yuv420p -crf 18 /mnt/home/mgoldstein/ceph/athenak/feb13/videos/mhd_jz_jz.mp4
+Traceback (most recent call last):
+  File "/mnt/home/mgoldstein/athenak_flatiron/plotting/make_video.py", line 332, in <module>
+    main()
+  File "/mnt/home/mgoldstein/athenak_flatiron/plotting/make_video.py", line 323, in main
+    stitch_video(framedir, video_path, args.fps)
+  File "/mnt/home/mgoldstein/athenak_flatiron/plotting/make_video.py", line 198, in stitch_video
+    subprocess.run(cmd, check=True, capture_output=True)
+  File "/mnt/sw/nix/store/b11qsc8pddw779l2cqsvvpjf9rkgcrrv-python-3.12.9-view/lib/python3.12/subprocess.py", line 573, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['ffmpeg', '-y', '-framerate', '30', '-i', '/tmp/video_mhd_jz_jz_xi7dhg1e/frame_%05d.png', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18', '/mnt/home/mgoldstein/ceph/athenak/feb13/videos/mhd_jz_jz.mp4']' returned non-zero exit status 187.
+(.venv) [mgoldstein@ccmlin077 athenak_flatiron]$  

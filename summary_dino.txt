@@ -1,0 +1,44 @@
+> ## 📄 Summary of arXiv:2507.02106
+>
+> **Short answer:** The paper studies a hybrid **physics forecasting + generative refinement** task — not just classical super-resolution or standalone forecasting.
+>
+> ---
+>
+> ### 🎯 What is the task?
+>
+> The paper focuses on **surrogate modeling of 2D incompressible magnetohydrodynamic (MHD) turbulence**.
+>
+> The goal is to efficiently approximate high-resolution PDE simulations by combining:
+>
+> 1. **A Physics-Informed Neural Operator (PINO)**  
+>    - Learns the **large-scale spatio-temporal evolution** of the system.  
+>    - Enforces PDE constraints.  
+>    - Produces a *coarse but physically consistent forecast*.
+>
+> 2. **A Conditional Diffusion Model**  
+>    - Takes the PINO output as conditioning input.  
+>    - Stochastically generates **missing high-frequency turbulent details**.  
+>    - Restores small-scale structure and correct turbulent statistics.
+>
+> ---
+>
+> ### 🧠 So is it super-resolution or forecasting?
+>
+> | Task | Included? | How |
+> |------|-----------|------|
+> | Forecasting | ✅ | PINO predicts temporal evolution of the fields. |
+> | Super-resolution | ✅ (generative refinement sense) | Diffusion restores fine-scale structure missing from PINO. |
+> | Classical image SR | ❌ | Not a standard pixel upsampling task. |
+>
+> ---
+>
+> ### 📌 Big Picture
+>
+> The framework is:
+>
+> **Physics-consistent coarse evolution (PINO)**  
+> ➜ **Generative fine-scale correction (Diffusion)**
+>
+> It’s best understood as a **hybrid forecasting + generative turbulence modeling approach**, designed to approximate expensive PDE simulations while preserving both physical consistency and realistic small-scale statistics.
+>
+

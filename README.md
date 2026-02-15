@@ -1,10 +1,21 @@
 
+
 # step 1: clone repo
 
 ```
 git clone --recursive https://github.com/IAS-Astrophysics/athenak.git
 ```
 the recursive is important since it also clones kokkos and athenak expects kokkos to be inside the athenak directory
+
+Also do
+```
+git clone https://github.com/semihkacmaz/DINOs dino
+```
+
+Both the athenak and the dino repos are git-ignored so they arent checked in, but parts of this repo assume they are both cloned/present. 
+
+Later once we make changes to dino we will need to check it in . 
+
 
 
 # step 2 checkout:

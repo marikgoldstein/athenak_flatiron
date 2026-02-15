@@ -1,0 +1,290 @@
+================================================================================
+PLAN: Adapting DINO framework for MRI MHD simulation data
+================================================================================
+Created: 2026-02-15
+Status: DRAFT
+
+================================================================================
+1. PROJECT CONTEXT
+================================================================================
+
+SIMULATION (AthenaK):
+- 2D MRI (Magnetorotational Instability) in a shearing box
+- Resolution: 2048x2048, 4 GPUs (64 meshblocks of 256x256 across 4 ranks)
+- Domain: [-0.5, 0.5] x [-0.5, 0.5], Lx=Ly=1.0
+- Physics: isothermal MHD, cs=1.0, viscosity=1e-4, resistivity=1e-4
+- Shearing box: qshear=1.5, omega0=1.0, beta=4000
+- Time limit: 628.31854 (= 100 orbits, T_orb = 2*pi)
+- Output dt = 0.62831853 (= 0.1 orbits) -> 1001 snapshots (00000..01000)
+- 3 variable groups:
+    mhd_w   -> primitive vars: density, vel1, vel2, vel3
+    mhd_bcc -> cell-centered B: bcc1, bcc2, bcc3
+    mhd_jz  -> current density jz
+- Data: /mnt/home/mgoldstein/ceph/athenak/feb13/bin/
+- 4 ranks: rank_00000000..rank_00000003
+
+DINO FRAMEWORK:
+- Hybrid PINO (Physics-Informed Neural Operator) + Conditional Diffusion
+- Originally for 2D INCOMPRESSIBLE MHD with vector potential (u, v, A)
+- Two fully separate training paths controlled by config_type:
+    "diffusion"  -> train_diffusion() [DiffusionDataset, UNet, MSE loss]
+    default      -> train_neural_operator() [MHDDataset, TFNO/FNO, MSE or PINN]
+
+KEY PHYSICS DIFFERENCE:
+- DINO: incompressible, constant density, vector potential A_z
+- MRI: compressible isothermal, shearing box (Coriolis + tidal + shear)
+- MRI variables: rho, vx, vy, (vz), Bx, By, (Bz), jz
+- This ONLY matters for the PINN loss (deferred to Phase 4)
+- For data-driven training (MSE loss, diffusion), physics doesn't matter --
+  the model just learns field-to-field mappings
+
+================================================================================
+2. DATA CONVERSION: AthenaK binary -> numpy
+================================================================================
+
+Script: plotting/convert_to_npy.py
+
+WHAT IT DOES:
+- Reads per-rank AthenaK .bin files using bin_convert.read_all_ranks_binary()
+- Assembles meshblocks into full 2D arrays using assemble_2d()
+- Downsamples from 2048x2048 to configurable target resolution
+- Saves as numpy .npy files
+
+CONFIGURABLE OPTIONS:
+  --bindir     : path to bin/ directory with rank_* subdirs
+  --outdir     : where to save npy files
+  --resolution : target resolution (default 256, i.e., 256x256)
+  --snapshots  : range of snapshots to process (default all: 0-1000)
+  --fields     : which fields to extract (default: all)
+  --downsample-method : "stride" or "antialias" (default: antialias)
+
+FIELDS TO EXTRACT:
+  Variable group  Field name    Physical meaning
+  --------------- ------------- -----------------
+  mhd_w           density       mass density rho
+  mhd_w           vel1          velocity vx (radial)
+  mhd_w           vel2          velocity vy (azimuthal)
+  mhd_w           vel3          velocity vz (vertical) -- may be zero in 2D
+  mhd_bcc         bcc1          magnetic field Bx
+  mhd_bcc         bcc2          magnetic field By
+  mhd_bcc         bcc3          magnetic field Bz
+  mhd_jz          Jcc3          current density jz
+  (exact field names will be confirmed by reading one snapshot's var_names)
+
+OUTPUT FILES (stored on ceph):
+  /mnt/home/mgoldstein/ceph/athenak/feb13/npy/
+    all_fields_256x256.npy     shape (1001, 256, 256, Nfields), float32
+    metadata.npz               field_names, times, x_coords, y_coords, etc.
+
+SIZE ESTIMATES:
+  128x128, 7 fields: (1001, 128, 128, 7) * 4 bytes = ~458 MB
+  256x256, 7 fields: (1001, 256, 256, 7) * 4 bytes = ~1.8 GB
+  512x512, 7 fields: (1001, 512, 512, 7) * 4 bytes = ~7.2 GB
+
+DOWNSAMPLING:
+- We only need to save at the highest resolution we'll train on (e.g., 256).
+- Any lower resolution (128, 64) for super-res inputs can be created
+  dynamically by the dataset script using scipy/torch downsampling.
+- Anti-aliased downsampling (scipy.ndimage.zoom or Fourier truncation)
+  is preferred over strided indexing to avoid aliasing artifacts.
+
+================================================================================
+3. DATASET CONSTRUCTION FOR DINO
+================================================================================
+
+Script: plotting/make_dino_dataset.py
+
+CREATING "SAMPLES" FROM ONE LONG SIMULATION:
+Since we have 1 long run (not many ICs), we use a sliding window:
+  - Window length T_window (e.g., 20-50 timesteps)
+  - Stride S (e.g., 5-10 timesteps)
+  - N_samples = (1001 - T_window) / S + 1
+  - Example: T_window=50, S=10 -> 96 samples
+
+CONFIGURABLE OPTIONS:
+  --input       : path to all_fields npy
+  --outdir      : where to save DINO-formatted data
+  --window      : T_window (default 50)
+  --stride      : stride (default 10)
+  --channels    : which field indices to include (default: vel1,vel2,bcc1 = 3ch)
+  --train-frac  : fraction for training (default 0.7)
+  --val-frac    : fraction for validation (default 0.15)
+  --format      : "neurops", "diffusion", or "both"
+
+FOR NEURAL OPERATOR (MHDDataset format):
+  Output: single .npy with shape (N_samples, T_window, Nx, Ny, C)
+  where C = number of selected channels
+  The dataloader internally reshapes to (N_samples, C, T_window, Nx, Ny)
+  and prepends coordinate grids for in_channels = C + 3 (t, x, y grids)
+
+FOR DIFFUSION (DiffusionDataset format):
+  Output: .npy containing a dict with:
+    "diff_inputs":  (N_samples, C, T_window, Nx, Ny)  <- low-res upsampled
+    "diff_targets": (N_samples, C, T_window, Nx, Ny)  <- high-res original
+  The dataloader reshapes (N_samples, C, T_window, Nx, Ny) -> (N*T, C, Nx, Ny)
+  so each spatial frame becomes an independent training sample.
+
+  For super-resolution:
+    diff_targets = data at resolution R (e.g., 256x256)
+    diff_inputs  = downsample to R/factor, then upsample back to R
+    The downsampling factor is configurable (e.g., 4x -> 64x64 -> 256x256)
+
+NORMALIZATION STATS:
+  Computed from training set only. Saved as .npz files:
+    train_stats.npz                    (for neural operator)
+    train_diffusion_inputs_stats.npz   (for diffusion inputs)
+    train_diffusion_targets_stats.npz  (for diffusion targets)
+  Each contains: channel_mins, channel_maxs (for minmax normalization)
+
+================================================================================
+4. WHAT NEEDS CODE CHANGES vs. CONFIG-ONLY
+================================================================================
+
+CONFIG-ONLY (no DINO source code edits):
+  - Diffusion model channel count: model_params.channels in YAML
+  - Neural operator channel count: model_params.in_channels, out_channels in YAML
+  - Disabling PINN: loss_params.type = "mse" (or just omit physics-informed)
+  - Image size: model_params.image_size in YAML
+  - Data paths, batch sizes, learning rates, etc.: all YAML
+  - The run_training.py entry point routes to the right training function
+    based on config_type: "diffusion" vs. default
+
+  KEY: Both training paths (diffusion and neural operator) already exist as
+  fully separate, independent codepaths. This is genuinely config-only --
+  no flags to add, no code to comment out. The diffusion path has NEVER
+  had PINN in it. The neural operator path switches between MSE and PINN
+  purely based on loss_params.type in the config YAML.
+
+SMALL CODE CHANGES NEEDED (minor):
+  1. UNet image_size assertion: ElucidatedDiffusion asserts h == image_size
+     and w == image_size. If we use non-square or non-power-of-2, may need
+     to relax this. For 128x128 or 256x256 this is fine.
+
+  2. UNet downsample_factor: The UNet checks that spatial dims are divisible
+     by its downsample_factor (2^num_levels). With dim_mults=[1,2,3,5,8,12]
+     (6 levels), needs divisible by 2^5=32. Both 128 and 256 are fine.
+
+  3. Normalization stats files: We need to generate our own .npz files
+     matching the format DINO expects: keys like "channel_mins", "channel_maxs"
+     for minmax, or "mean", "std" for standard normalization.
+
+  4. The diffusion conditioning mechanism: The UNet uses "self_condition"
+     which concatenates x_self_cond with the noisy image along channels.
+     In training, l_fidel (low-fidelity input) is passed as self_cond.
+     If self_cond is None, zeros are substituted. So conditioning CAN be
+     effectively disabled by passing zeros (or setting self_condition=False
+     in the config), but for super-resolution we WANT conditioning --
+     the low-res input IS the conditioning signal.
+
+NO CODE CHANGES NEEDED FOR PHASE 1-3:
+  As long as we:
+  - Prepare data in the expected .npy format/shape
+  - Set channels correctly in config
+  - Set image_size correctly
+  - Use compatible dim_mults for the chosen image_size
+
+DEFERRED (Phase 4 -- MRI PINN):
+  - New file: dino/src/physics/mri_pde_solvers.py
+  - New file: dino/src/losses/mri_physics_informed.py
+  - Register the new loss type so it can be selected via config
+
+================================================================================
+5. PHASE PLAN
+================================================================================
+
+PHASE 1: Data pipeline
+  [ ] Write plotting/convert_to_npy.py
+  [ ] Test on 1 snapshot, verify fields match existing plots
+  [ ] Run on all 1001 snapshots at 256x256
+  [ ] Quick visualization sanity check
+
+PHASE 2: Dataset creation
+  [ ] Write plotting/make_dino_dataset.py
+  [ ] Create sliding-window samples
+  [ ] Split train/val/test
+  [ ] Generate diffusion format (low-res inputs + high-res targets)
+  [ ] Generate neural operator format
+  [ ] Compute and save normalization stats
+
+PHASE 3: Diffusion super-resolution (first ML test)
+  [ ] Write dino/configs/config_diffusion_mri.yaml
+      - config_type: "diffusion"
+      - channels: 3 (or however many we pick)
+      - image_size: 128 (start small for fast iteration)
+      - Smaller UNet: base_dim=64, dim_mults=[1,2,4,8]
+  [ ] Test training run on small subset
+  [ ] Full training run
+  [ ] Evaluate: visual quality, power spectra comparison
+
+PHASE 4: Neural operator forecasting (MSE only)
+  [ ] Write dino/configs/config_neurops_mri.yaml
+      - model_type: tfno
+      - in_channels: C+3, out_channels: C
+      - loss_params.type: "mse"
+  [ ] Train and evaluate
+
+PHASE 5 (later): MRI PINN loss
+  [ ] Implement MRI shearing box PDE residuals
+  [ ] Register as new loss type
+  [ ] Compare PINN vs MSE-only
+
+PHASE 6 (later): Full PINO + Diffusion pipeline
+
+================================================================================
+6. FILE ORGANIZATION
+================================================================================
+
+NEW FILES TO CREATE (Phases 1-3):
+  plotting/convert_to_npy.py              # bin -> npy converter
+  plotting/make_dino_dataset.py           # npy -> DINO dataset formatter
+  dino/configs/config_diffusion_mri.yaml  # diffusion config for MRI
+  dino/configs/config_neurops_mri.yaml    # neural operator config for MRI
+
+DATA PATHS:
+  /mnt/home/mgoldstein/ceph/athenak/feb13/npy/
+    all_fields_256x256.npy                # (1001, 256, 256, Nfields)
+    metadata.npz                          # field names, times, coords
+  /mnt/home/mgoldstein/ceph/athenak/feb13/dino/
+    neurops_train.npy                     # (N_train, T_window, Nx, Ny, C)
+    diffusion_train.npy                   # dict: diff_inputs, diff_targets
+    diffusion_val.npy                     # same format
+    diffusion_test.npy                    # same format
+    stats/
+      train_stats.npz
+      train_diffusion_inputs_stats.npz
+      train_diffusion_targets_stats.npz
+
+DEFERRED FILES (Phase 5):
+  dino/src/physics/mri_pde_solvers.py
+  dino/src/losses/mri_physics_informed.py
+
+================================================================================
+7. FIRST CONCRETE STEPS (what to implement now)
+================================================================================
+
+STEP 1: plotting/convert_to_npy.py
+  - Read one snapshot to discover exact field names (var_names from bin_convert)
+  - Loop over snapshots, read all ranks, assemble 2D, downsample, accumulate
+  - Save combined npy + metadata
+  - Make resolution configurable (default 256)
+
+STEP 2: Test on a few snapshots, visualize, compare with existing plots
+
+STEP 3: Run full conversion (all 1001 snapshots)
+
+STEP 4: plotting/make_dino_dataset.py
+  - Sliding window -> samples
+  - Train/val/test split
+  - Diffusion format: generate low-res inputs dynamically
+  - Save normalization stats
+
+STEP 5: dino/configs/config_diffusion_mri.yaml
+  - Start with 128x128 for fast iteration
+  - 3 channels (e.g., vel1, vel2, bcc1)
+  - Small UNet for testing
+
+STEP 6: Test training run
+
+================================================================================
+END OF PLAN
+================================================================================
