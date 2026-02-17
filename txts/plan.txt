@@ -2,7 +2,9 @@
 PLAN: Adapting DINO framework for MRI MHD simulation data
 ================================================================================
 Created: 2026-02-15
-Status: IN PROGRESS (Phases 1-2 complete, Phase 3 ready to test, Phase 0 in progress)
+Updated: 2026-02-17
+Status: IN PROGRESS — sim parameter search done, production seeds running,
+        processing pipeline reorganized, Phases 1-2 complete
 
 ================================================================================
 QUICK CONTEXT FOR NEW SESSIONS
@@ -11,30 +13,52 @@ QUICK CONTEXT FOR NEW SESSIONS
 GOAL: Use the DINO neural operator + diffusion framework (dino/ subdir) to
 model our 2D MRI MHD simulation data (from AthenaK, athenak/ subdir).
 
+CURRENT FOCUS: Super-resolution — train on downsampled-256 -> native 256,
+apply at inference to native-128 -> predicted 256.
+
 WHAT'S DONE:
-  - plotting/convert_to_npy.py converts AthenaK binary -> numpy (done, 2.1 GB)
-  - plotting/make_dino_dataset.py creates DINO-format datasets (done, 128x128)
-  - dino/configs/config_diffusion_mri.yaml and config_neurops_mri.yaml written
-  - Data lives on ceph: /mnt/home/mgoldstein/ceph/athenak/feb13/{npy,dino}/
-  - Current dataset: 3 channels (velx, vely, Bx), 96 sliding-window samples,
-    128x128 spatial, 50-timestep windows, 4x super-res for diffusion
+  - Simulation parameter search COMPLETE (see searching_for_sim.txt):
+      Winner: nu=eta=3e-5, training window orbits 5-50 (snaps 50-500)
+      Smallest domain gap between native 128 and downsampled 256
+  - ~100 production seeds running at 256x256, nu=3e-5, 1 GPU each
+    Location: /mnt/home/mgoldstein/ceph/athenak/mri256_nu3e-5/seed_*/
+    Runtime: ~45 min per seed for 50 orbits
+  - processing/ subdir created for data pipeline (separated from plotting/):
+      processing/convert_to_npy.py   — bin->npy, per-seed, snap range args
+      processing/make_dino_dataset.py — npy->DINO format (copied, not yet updated)
+  - Old pipeline (plotting/) still works for feb13 2048x2048 data
   - simple_diffusion/ standalone flow matching super-res (DINO-independent)
-    - UNet from gf3 (ResBlock+scale-shift, attention, Fourier time emb), ~43M params
-    - Flow matching on all 8 MHD channels at 256x256, 2x super-res
-    - Overfit mode for sanity-checking (single batch, currently being tested)
+  - dino/configs/ for diffusion and neural operator configs
 
 WHAT'S NEXT:
-  - Phase 0: Verify simple_diffusion overfit test converges, then full training
-  - Phase 3: Test diffusion super-res training (no code changes needed, just run)
-  - Known issue: train/val/test split is contiguous in time, causing amplitude
-    mismatch (MRI growth phase in train, saturated in val/test). Can shuffle later.
-  - Later: neural operator training (Phase 4), MRI PINN loss (Phase 5)
+  1. Wait for seed runs to finish (~45 min each)
+  2. Convert seeds to npy: processing/convert_to_npy.py --snap-start 50 --snap-end 500
+     (batch all seeds in parallel, see docstring for shell loop)
+  3. Build super-res dataset from multi-seed data
+     - Input: native 256 downsampled to 128 (or use avg_pool)
+     - Target: native 256
+     - Split by seed (not by time) to avoid leakage
+  4. Train super-res model (simple_diffusion or DINO diffusion)
+  5. Validate on native 128 input at inference
 
 KEY COMMANDS:
   module load python/3.11.11
-  cd dino && python3 run_training.py --config configs/config_diffusion_mri.yaml
+
+  # Convert one seed (snaps 50-500):
+  python processing/convert_to_npy.py \
+    --bindir .../mri256_nu3e-5/seed_0000/bin \
+    --outdir .../mri256_nu3e-5/seed_0000/npy \
+    --snap-start 50 --snap-end 500
+
+  # Batch all seeds:
+  for d in .../mri256_nu3e-5/seed_*/; do
+    python processing/convert_to_npy.py \
+      --bindir "$d/bin" --outdir "$d/npy" \
+      --snap-start 50 --snap-end 500 &
+  done; wait
 
 SEE SECTIONS BELOW FOR FULL DETAILS.
+SEE ALSO: searching_for_sim.txt for simulation parameter search results.
 
 ================================================================================
 1. PROJECT CONTEXT
@@ -234,54 +258,52 @@ PHASE 0: Standalone flow matching super-res [IN PROGRESS]
   Purpose: DINO-independent sanity check — minimal code, fast iteration.
   Lives in simple_diffusion/ (not part of DINO framework).
   [x] Write simple_diffusion/model.py — UNet adapted from gf3/models/mg_unet.py
-      - Configurable channels/resolution, single time embedding, no augmentation
-      - model_channels=128, channel_mult=(1,2,2,2), attention at 64x64
-      - in_channels=16 (8ch xt + 8ch x_lo), out_channels=8, ~43M params
   [x] Write simple_diffusion/trainer.py — flow matching training + Euler sampling
-      - All 8 MHD fields at 256x256, 2x super-res (avg_pool->bilinear)
-      - Flow matching: linear interpolation, velocity prediction, MSE loss
-      - Overfit flag: trains on single fixed batch for sanity checking
-      - Wandb logging: comparison plots (LR / true HR / generated HR)
   [x] Write simple_diffusion/README.md
   [ ] Verify overfit test converges (loss -> 0, samples match ground truth)
-  [ ] Full training run on all 1001 snapshots
+  [ ] Full training run on multi-seed data (after seeds finish)
 
-PHASE 1: Data pipeline [COMPLETE]
-  [x] Write plotting/convert_to_npy.py
-  [x] Test on 3 snapshots, verify fields + sanity check plot
-  [x] Run on all 1001 snapshots at 256x256 (50 min, 2.1 GB)
-  [x] Quick visualization sanity check (plotting/sanity_check_256.png)
+PHASE 1: Data pipeline [COMPLETE, REORGANIZED 2026-02-17]
+  [x] Original: plotting/convert_to_npy.py (for feb13 2048x2048 data)
+  [x] New: processing/convert_to_npy.py (for multi-seed workflow)
+      - --bindir and --outdir required (no hardcoded defaults)
+      - --resolution defaults to native (no downsampling)
+      - Single-rank fallback for 1-GPU seed runs
+      - Auto-detects native resolution from first snapshot
+  [x] processing/make_dino_dataset.py copied from plotting/ (not yet updated)
 
-PHASE 2: Dataset creation [COMPLETE]
-  [x] Write plotting/make_dino_dataset.py (with --target-resolution option)
-  [x] Tested on fake data -- output formats verified compatible with DINO
-  [x] Run on real 256x256 data -> 128x128 datasets
-  [x] 96 samples, 67/14/15 train/val/test split
-  [x] Diffusion format with 4x super-res (128->32->128)
-  [x] Neural operator format
-  [x] Normalization stats saved
+PHASE 1.5: Simulation parameter search [COMPLETE 2026-02-16]
+  See searching_for_sim.txt for full details.
+  [x] Swept nu=eta: 1e-3, 1e-4, 5e-5, 3e-5, 1e-5 at 128 and 256
+  [x] Winner: nu=eta=3e-5 (smallest domain gap, slowest decay)
+  [x] Training window: orbits 5-50 (snaps 50-500)
+  [x] Input decks: decks/mri2d.athinput.{128,256}
+  [x] Launch scripts: toy_sweep.sbatch + toy.sh
+
+PHASE 1.75: Production seed runs [IN PROGRESS 2026-02-17]
+  [x] Launched ~100 seeds at 256x256, nu=eta=3e-5, 1 GPU each
+      Location: /mnt/home/mgoldstein/ceph/athenak/mri256_nu3e-5/seed_*/
+      Runtime: ~45 min per seed (50 orbits = 314 sim seconds)
+  [ ] Wait for completion
+  [ ] Convert snaps 50-500 to npy (processing/convert_to_npy.py, batch loop)
+
+PHASE 2: Dataset creation [COMPLETE for feb13, NEEDS UPDATE for seeds]
+  [x] plotting/make_dino_dataset.py works for single-run data
+  [ ] Update processing/make_dino_dataset.py for multi-seed super-res:
+      - Aggregate multiple seeds into one dataset
+      - Split by SEED (not time) to avoid leakage
+      - Input: native 256 downsampled to 128
+      - Target: native 256
 
 PHASE 3: Diffusion super-resolution (first ML test) [READY]
   [x] Write dino/configs/config_diffusion_mri.yaml
-      - config_type: "diffusion"
-      - channels: 3 (velx, vely, Bx)
-      - image_size: 128
-      - Smaller UNet: base_dim=64, dim_mults=[1,2,4,8]
-  [ ] Test training run
-  [ ] Full training run
-  [ ] Evaluate: visual quality, power spectra comparison
+  [ ] Test training run (on multi-seed data once ready)
 
 PHASE 4: Neural operator forecasting (MSE only)
   [x] Write dino/configs/config_neurops_mri.yaml
-      - model_type: fno 3d
-      - in_channels: 6 (3 coord grids + 3 fields), out_channels: 3
-      - loss_params.type: "mse"
   [ ] Train and evaluate
 
 PHASE 5 (later): MRI PINN loss
-  [ ] Implement MRI shearing box PDE residuals
-  [ ] Register as new loss type
-  [ ] Compare PINN vs MSE-only
 
 PHASE 6 (later): Full PINO + Diffusion pipeline
 
@@ -289,9 +311,19 @@ PHASE 6 (later): Full PINO + Diffusion pipeline
 6. FILES CREATED
 ================================================================================
 
-SCRIPTS:
-  plotting/convert_to_npy.py              # bin -> npy converter
+PROCESSING SCRIPTS (new, multi-seed workflow):
+  processing/convert_to_npy.py            # bin -> npy, per-seed, snap range args
+  processing/make_dino_dataset.py         # npy -> DINO format (copied, needs update)
+
+PLOTTING SCRIPTS (original, feb13 data):
+  plotting/convert_to_npy.py              # bin -> npy (hardcoded feb13 defaults)
   plotting/make_dino_dataset.py           # npy -> DINO dataset formatter
+  plotting/make_video.py                  # mp4 from raw bins
+  plotting/make_video_from_npy.py         # mp4 from npy (faster)
+  plotting/domain_gap_analysis.py         # domain gap comparison
+  plotting/analyze_sweep.py              # turbulence sustainability
+
+ML CODE:
   simple_diffusion/model.py               # UNet (from gf3), ~43M params
   simple_diffusion/trainer.py             # flow matching train/sample/viz
   simple_diffusion/README.md              # documentation
@@ -300,7 +332,12 @@ CONFIGS:
   dino/configs/config_diffusion_mri.yaml  # diffusion super-res config
   dino/configs/config_neurops_mri.yaml    # neural operator MSE config
 
-DATA ON CEPH:
+SIMULATION LAUNCH:
+  decks/mri2d.athinput.{128,256}          # input decks for 128/256 runs
+  toy_sweep.sbatch                        # parameterized sbatch (RES, NU env vars)
+  toy.sh                                  # launches nu/eta sweep
+
+DATA ON CEPH (feb13, 2048x2048, old):
   /mnt/home/mgoldstein/ceph/athenak/feb13/npy/
     all_fields_256x256.npy                # (1001, 256, 256, 8) 2.1 GB
     metadata.npz                          # field names, times, coords
@@ -309,10 +346,12 @@ DATA ON CEPH:
     neurops_{train,val,test}.npy          # per-split
     diffusion_{train,val,test}.npy        # dict: diff_inputs, diff_targets
     dataset_info.npz                      # split info, params
-    stats/
-      train_neurops_stats.npz
-      train_diffusion_inputs_stats.npz
-      train_diffusion_targets_stats.npz
+    stats/                                # normalization stats
+
+DATA ON CEPH (production seeds, nu=3e-5, IN PROGRESS):
+  /mnt/home/mgoldstein/ceph/athenak/mri256_nu3e-5/seed_*/
+    bin/                                  # raw AthenaK output (running)
+    npy/                                  # to be created after runs finish
 
 DEFERRED:
   dino/src/physics/mri_pde_solvers.py     # MRI PINN (Phase 5)
@@ -324,6 +363,31 @@ DEFERRED:
 
 ENVIRONMENT:
   module load python/3.11.11   # needed for h5py, scipy, numpy, torch
+
+--- NEW WORKFLOW (multi-seed, nu=3e-5) ---
+
+STEP 1 - Seeds are running (~45 min each for 50 orbits):
+  Location: /mnt/home/mgoldstein/ceph/athenak/mri256_nu3e-5/seed_*/
+
+STEP 2 - Convert seed bins to npy (snaps 50-500):
+  # Single seed:
+  python3 processing/convert_to_npy.py \
+    --bindir /mnt/home/mgoldstein/ceph/athenak/mri256_nu3e-5/seed_0000/bin \
+    --outdir /mnt/home/mgoldstein/ceph/athenak/mri256_nu3e-5/seed_0000/npy \
+    --snap-start 50 --snap-end 500
+
+  # Batch all seeds in parallel:
+  for d in /mnt/home/mgoldstein/ceph/athenak/mri256_nu3e-5/seed_*/; do
+    python3 processing/convert_to_npy.py \
+      --bindir "$d/bin" --outdir "$d/npy" \
+      --snap-start 50 --snap-end 500 &
+  done; wait
+
+STEP 3 - Build super-res dataset (TODO — update make_dino_dataset.py)
+
+STEP 4 - Train super-res model
+
+--- OLD WORKFLOW (feb13 2048x2048 single run) ---
 
 STEP 1 - Convert simulation data (already done):
   python3 plotting/convert_to_npy.py --resolution 256
@@ -337,7 +401,7 @@ STEP 2 - Create DINO datasets (already done):
 
 STEP 3a - Standalone flow matching (simple_diffusion/, DINO-independent):
   source load.sh
-  python3 simple_diffusion/trainer.py          # set overfit=True for sanity check
+  python3 simple_diffusion/trainer.py
 
 STEP 3b - Train diffusion model (DINO framework):
   cd dino
