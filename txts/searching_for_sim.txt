@@ -1,0 +1,249 @@
+================================================================================
+SEARCHING FOR THE RIGHT SIMULATION PARAMETERS FOR SUPER-RES TRAINING
+================================================================================
+Created: 2026-02-16
+Status: DECIDED — nu=eta=3e-5, training window orbits 5-50 (snaps 50-500)
+
+================================================================================
+GOAL
+================================================================================
+
+Find nu/eta (viscosity/resistivity) for 128x128 and 256x256 MRI simulations
+such that:
+  1. The MRI grows and sustains turbulence (not just decays)
+  2. The domain gap between native 128 and downsampled 256 is small
+     (power spectra and PDFs match at low-k)
+  3. There's meaningful small-scale structure at 256 to super-resolve
+
+This matters because the super-res model will be trained on:
+  - Input:  256 simulation downsampled to 128
+  - Target: native 256 simulation
+But at inference it receives:
+  - Input:  native 128 simulation (cheaper to run)
+
+If downsampled-256 looks very different from native-128, the model won't
+generalize. So we need both resolutions to capture the same large-scale
+dynamics, with 256 having sharper/more detailed small scales.
+
+================================================================================
+SIMULATION SETUP
+================================================================================
+
+Code: AthenaK (GPU MHD), problem generator: athenak/src/pgen/mri2d.cpp
+  - 2D shearing box, isothermal, cs=1, Omega=1, qshear=1.5, beta=4000
+  - Random seed perturbs PRESSURE only (density via EOS)
+  - B-field ICs are deterministic (zero-net-flux sinusoidal Bz)
+  - jz, vel, bcc all start identical across seeds; only density differs at t=0
+  - Differences grow as MRI amplifies the perturbations
+
+Input decks: decks/mri2d.athinput.{128,256}
+  - 128: nx1=nx2=128, meshblock 64x64
+  - 256: nx1=nx2=256, meshblock 128x128
+  - Both: tlim=628.32 (100 orbits), 1001 output snapshots
+
+Launch scripts: toy_sweep.sbatch + toy.sh
+  - Parameterized by RES and NU (passed as env vars)
+  - nu/eta overridden on command line (no need for separate decks)
+  - 1 GPU, 8 CPUs per job
+
+Key file: athenak/src/pgen/mri2d.cpp
+  - Line 68: reads rand_seed from input
+  - Line 120: seeds Kokkos RNG: Random_XorShift64_Pool(gids + rand_seed)
+
+================================================================================
+EXPERIMENTS AND FINDINGS
+================================================================================
+
+--- Experiment 1: nu=eta=1e-3, 128x128, 3 seeds, t=50 (8 orbits) ---
+Location: /mnt/home/mgoldstein/ceph/athenak/mri128_seeds_toy/ (old data)
+
+Result: MRI DOES NOT GROW. All perturbations decay.
+  - Dissipation scale l_diss ~ sqrt(nu) ~ 0.032 ~ 4 cells at 128
+  - Damping time ~ L^2/nu ~ 20 time units, kills MRI before it can grow
+  - Only density differs across seeds (at t=0); all other fields identical
+  - jz, vel, bcc barely distinguish between seeds even at t=50
+
+--- Experiment 2: nu=eta=1e-5, 128x128, 3 seeds, t=628 (100 orbits) ---
+Location: /mnt/home/mgoldstein/ceph/athenak/mri128_seeds_toy/ (updated data)
+
+Result: MRI GROWS, SUSTAINED TURBULENCE.
+  - jz std at snap 200 (~20 orbits): varies 0.03 to 0.23 across seeds
+  - Seeds clearly diverge (chaotic), max diff ~1.9
+  - Global jz range: [-4.9, 6.5]
+  - Videos made: .../mri128_seeds_toy/videos/seed_000{0,1,2}/mhd_jz_jz.mp4
+  - BUT: l_diss ~ sqrt(1e-5) ~ 0.003, below both 128 and 256 grid scales
+    -> both resolutions in numerical dissipation regime
+    -> domain gap may be large (differences are grid artifacts, not physics)
+
+--- Experiment 3: nu=eta=1e-4, 128 and 256, 3 seeds, t=628 (100 orbits) ---
+Location: /mnt/home/mgoldstein/ceph/athenak/mri{128,256}_check/
+
+Result: MRI DOES NOT SUSTAIN. Transient burst then decay.
+  - jz peaks at snap ~50 (5 orbits): std ~4-5 (good!)
+  - Then decays monotonically: std ~0.015 by snap 500, ~0.003 by snap 1000
+  - Not sustained turbulence — viscosity wins after initial channel flow
+  - Domain gap IS small (128 and 256 track almost identically)
+  - But nothing interesting to super-resolve at late times
+
+  Power spectra comparison saved: /mnt/home/mgoldstein/ceph/athenak/domain_gap_comparison.png
+  - Low-k spectra match between 128, 256, and downsampled-256
+  - But amplitudes tiny by snap 500
+
+  Note: feb16_128 and feb16_128_another_one are IDENTICAL runs (same seed),
+  also at 1e-4, also show same decay behavior.
+
+--- Experiment 4: nu=eta=3e-5 and 5e-5, 128 and 256, 1 seed each ---
+Location:
+  /mnt/home/mgoldstein/ceph/athenak/mri128_nu3e-5/seed_0000/
+  /mnt/home/mgoldstein/ceph/athenak/mri256_nu3e-5/seed_0000/
+  /mnt/home/mgoldstein/ceph/athenak/mri128_nu5e-5/seed_0000/
+  /mnt/home/mgoldstein/ceph/athenak/mri256_nu5e-5/seed_0000/
+
+Status: COMPLETE. All 4 runs finished (1001 snapshots each, 100 orbits).
+
+--- nu=3e-5 results (WINNER) ---
+
+  Turbulence sustainability (from history file KE):
+    128: late/mid KE ratio = 0.441 -> SUSTAINED
+    256: late/mid KE ratio = 0.508 -> SUSTAINED
+
+  jz amplitude evolution (from domain_gap_analysis.py):
+    Both peak at ~5 orbits (std ~5-10), then decay slowly.
+    Still meaningful amplitude through ~50 orbits.
+    By 100 orbits, jz std ~ 0.003 (128) and 0.003 (256).
+    Not a true steady state, but slowest decay of all nu tested.
+
+  Domain gap (native 128 vs downsampled 256):
+    Snap 500 (~50 orbits):
+      128 jz std = 8.65e-3, 256 jz std = 8.74e-3  -> ratio 0.99 (excellent!)
+      PDFs overlap well, power spectra match at low-k
+      L2 gap = 1.01e-2
+    Snap 800 (~80 orbits):
+      128 jz std = 6.08e-3, 256 jz std = 3.74e-3  -> ratio 1.6x (gap opening)
+      L2 gap = 4.86e-3
+
+  Plots saved:
+    /mnt/home/mgoldstein/ceph/athenak/domain_gap_comparison_nu3e-5.png
+    /mnt/home/mgoldstein/ceph/athenak/domain_gap_comparison_nu3e-5_snap800.png
+    /mnt/home/mgoldstein/ceph/athenak/jz_evolution_nu3e-5.png
+
+--- nu=5e-5 results (REJECTED — large domain gap) ---
+
+  Turbulence sustainability:
+    128: late/mid KE ratio = 0.440 -> SUSTAINED
+    256: late/mid KE ratio = 0.280 -> DECAYING
+
+  Domain gap (native 128 vs downsampled 256):
+    Snap 500: 128 std=2.91e-2, 256 std=1.19e-2 -> 2.4x mismatch! BAD.
+    Snap 800: 128 std=1.15e-2, 256 std=7.96e-2 -> 1.4x
+    PDFs visibly different, power spectra offset.
+    The 128 run is much more active than 256 at same time — model
+    trained on downsampled-256 would see very different stats at inference.
+
+  Plots saved:
+    /mnt/home/mgoldstein/ceph/athenak/domain_gap_comparison_nu5e-5.png
+    /mnt/home/mgoldstein/ceph/athenak/domain_gap_comparison_nu5e-5_snap800.png
+    /mnt/home/mgoldstein/ceph/athenak/jz_evolution_nu5e-5.png
+
+  Overall turbulence sustainability plot (all nu values):
+    /mnt/home/mgoldstein/ceph/athenak/turbulence_sustainability.png
+
+================================================================================
+DISSIPATION SCALE REFERENCE TABLE
+================================================================================
+
+l_diss ~ sqrt(nu/Omega), Omega=1
+
+  nu=eta    l_diss    cells@128    cells@256    Status
+  ------    ------    ---------    ---------    ------
+  1e-3      0.032     ~4           ~8           MRI killed (too dissipative)
+  1e-4      0.010     ~1.3         ~2.6         Transient only (decays fast)
+  5e-5      0.007     ~0.9         ~1.8         Slow decay, but large domain gap (2.4x)
+  3e-5      0.005     ~0.7         ~1.4         <<< CHOSEN — slow decay, tiny domain gap
+  1e-5      0.003     ~0.4         ~0.8         Sustained turb, but numerical diss.
+
+dx at 128 = 1/128 = 0.0078
+dx at 256 = 1/256 = 0.0039
+
+================================================================================
+DECISION: nu=eta=3e-5, TRAINING WINDOW orbits 5-50 (snaps 50-500)
+================================================================================
+
+Why nu=3e-5:
+  - Smallest domain gap of any nu tested (128 vs ds-256 ratio ~0.99 at snap 500)
+  - Slowest turbulence decay (late/mid KE ratio ~0.5)
+  - Both 128 and 256 show similar dynamics and amplitudes
+  - 256 has meaningful extra small-scale structure for super-resolution
+
+Why orbits 5-50 (snaps 50-500):
+  - Before orbit 5: MRI still in linear growth phase, not turbulent yet
+  - Orbits 5-50: good turbulent amplitude, domain gap stays small
+  - After orbit 50: amplitudes getting small, domain gap starts opening
+    (by snap 800, 128/256 ratio is 1.6x instead of ~1.0x)
+
+Note on "sustained" turbulence:
+  None of the nu values produce a true statistical steady state in 2D
+  zero-net-flux MRI. All show a transient channel flow burst (~5 orbits)
+  followed by slow decay. This is likely intrinsic to 2D. nu=3e-5 just
+  decays the slowest, giving us the longest usable training window.
+
+NEXT STEPS:
+  1. Scale up: run ~100 seeds at 256 with nu=eta=3e-5
+     - 24 GPUs available, ~2hr per 256 run -> 100 runs in ~1 day
+     - Only need 256 runs (downsample for 128 input)
+     - Native 128 runs only needed for final validation
+  2. Convert snapshots 50-500 to npy for training
+  3. Build super-res dataset (ds-256 as input, native 256 as target)
+
+================================================================================
+VIDEOS CREATED
+================================================================================
+
+Feb13 2048x2048 jz video (full resolution, vmin=-20, vmax=20):
+  /mnt/home/mgoldstein/ceph/athenak/feb13/videos/mhd_jz_jz.mp4
+
+Toy 128 seed videos (nu=1e-5, vmin=-5, vmax=5):
+  /mnt/home/mgoldstein/ceph/athenak/mri128_seeds_toy/videos/seed_0000/mhd_jz_jz.mp4
+  /mnt/home/mgoldstein/ceph/athenak/mri128_seeds_toy/videos/seed_0001/mhd_jz_jz.mp4
+  /mnt/home/mgoldstein/ceph/athenak/mri128_seeds_toy/videos/seed_0002/mhd_jz_jz.mp4
+
+Toy 128 density videos (nu=1e-3, from earlier short runs):
+  /mnt/home/mgoldstein/ceph/athenak/mri128_seeds_toy/videos/seed_000{0,1,2}/mhd_w_dens.mp4
+
+================================================================================
+KEY SCRIPTS
+================================================================================
+
+plotting/make_video.py         -- renders mp4 from raw AthenaK bins
+  Added --vmin/--vmax flags this session to override color range
+  Example: python plotting/make_video.py \
+    --bindir .../bin --fields jz --vmin -5 --vmax 5 --vscale linear --workers 4
+
+plotting/make_video_from_npy.py -- renders mp4 from pre-converted npy (faster)
+
+plotting/domain_gap_analysis.py -- domain gap comparison (spectra, PDFs, visual)
+  Compares native 128 vs native 256 vs downsampled 256->128.
+  Produces: power spectra, PDFs, side-by-side images, jz time evolution.
+  Example (for the 1e-4 check runs):
+    python plotting/domain_gap_analysis.py \
+      --dir128 /mnt/home/mgoldstein/ceph/athenak/mri128_check \
+      --dir256 /mnt/home/mgoldstein/ceph/athenak/mri256_check \
+      --seeds 0 1 --snap 500 \
+      --outdir /mnt/home/mgoldstein/ceph/athenak/ --label nu1e-4
+  Example (for the nu sweep):
+    python plotting/domain_gap_analysis.py \
+      --dir128 /mnt/home/mgoldstein/ceph/athenak/mri128_nu3e-5 \
+      --dir256 /mnt/home/mgoldstein/ceph/athenak/mri256_nu3e-5 \
+      --seeds 0 --snap 500 \
+      --outdir /mnt/home/mgoldstein/ceph/athenak/ --label nu3e-5
+
+plotting/analyze_sweep.py      -- turbulence sustainability from history files
+  Reads HB3.mhd.hst, plots KE/ME evolution, computes late/mid ratios.
+  Produces: /mnt/home/mgoldstein/ceph/athenak/turbulence_sustainability.png
+
+toy_sweep.sbatch               -- parameterized sbatch (RES, NU as env vars)
+toy.sh                         -- launches nu/eta sweep
+
+================================================================================
+END
+================================================================================

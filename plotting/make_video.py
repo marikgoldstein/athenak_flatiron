@@ -241,6 +241,8 @@ def main():
         help="Downsample data to NxN before plotting (default: native resolution)",
     )
     parser.add_argument("--cmap", default=None, help="Colormap override")
+    parser.add_argument("--vmin", type=float, default=None, help="Override color scale min")
+    parser.add_argument("--vmax", type=float, default=None, help="Override color scale max")
     parser.add_argument(
         "--vscale", default=None, choices=["linear", "log", "symmetric"],
         help="Force color scale mode (default: auto per field)",
@@ -297,12 +299,16 @@ def main():
         for field in field_names:
             print(f"\n  --- {vg}/{field}: {len(snapshots)} frames ---")
 
-            # Pre-scan to fix the colorbar across all frames
-            print(f"  Pre-scanning {len(snapshots)} snapshots for global color range...")
-            gmin, gmax, gpos_min = compute_global_range(
-                args.bindir, vg, field, snapshots, args.resolution
-            )
-            print(f"  Global range: [{gmin:.4e}, {gmax:.4e}]")
+            # Determine color range
+            if args.vmin is not None and args.vmax is not None:
+                gmin, gmax, gpos_min = args.vmin, args.vmax, abs(args.vmin) if args.vmin > 0 else 1e-10
+                print(f"  Using user-specified color range: [{gmin}, {gmax}]")
+            else:
+                print(f"  Pre-scanning {len(snapshots)} snapshots for global color range...")
+                gmin, gmax, gpos_min = compute_global_range(
+                    args.bindir, vg, field, snapshots, args.resolution
+                )
+                print(f"  Global range: [{gmin:.4e}, {gmax:.4e}]")
 
             framedir = tempfile.mkdtemp(prefix=f"video_{vg}_{field}_")
             try:

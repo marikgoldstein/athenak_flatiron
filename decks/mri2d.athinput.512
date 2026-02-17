@@ -72,6 +72,7 @@ beta               = 4000  # Plasma beta
 amp                = 0.01  # dP/P (adiabatic) or drho/rho (isothermal) < = amp
 ifield             = 1     # 1 for zero-net-flux Bz, 2 for constant Bz
 nwx                = 1     # wavenumber in x1
+rand_seed          = 0     # RNG seed for initial perturbations (added to meshblock gid)
 user_hist          = false  # enroll user-defined history function
 # start of shearing box options compatibile with older athenak Liang used
 shearing_box       = true  # enable shearing box

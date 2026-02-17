@@ -1,3 +1,10 @@
+#python plotting/postprocess_bins.py --bindir /mnt/home/mgoldstein/ceph/athenak/feb13_512/bin --variable mhd_jz --field jz --snapshot 00002
+
+
+#  Key options: --variable (mhd_w/mhd_bcc/mhd_jz), --field (dens/velx/bcc1/jz/etc.), --snapshot (00000-00002), --vscale (linear/log/symmetric), --cmap, --no-save-athdf.
+
+
+
 #Key flags:                                                                                                                                                         
 #                                                                                                                                                                    #  ┌──────────────┬─────────────────────┬───────────────────────────────────────┐                                                                              
 #│     Flag     │       Default       │              Description              │                                                                                    
@@ -39,4 +46,10 @@
 
 #source load.sh
 #module load ffmpeg
-python plotting/make_video.py --bindir /mnt/home/mgoldstein/ceph/athenak/feb13/bin  --workers 4 --field bcc1
+#python plotting/make_video.py --bindir /mnt/home/mgoldstein/ceph/athenak/feb13/bin  --workers 4 --field bcc1
+#source load.sh
+#module load ffmpeg
+
+#../ceph/athenak/feb16_128
+
+python plotting/make_video.py --bindir /mnt/home/mgoldstein/ceph/athenak/feb16_128/bin --fields jz --vscale linear

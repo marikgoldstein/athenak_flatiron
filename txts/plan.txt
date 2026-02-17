@@ -1,0 +1,352 @@
+================================================================================
+PLAN: Adapting DINO framework for MRI MHD simulation data
+================================================================================
+Created: 2026-02-15
+Status: IN PROGRESS (Phases 1-2 complete, Phase 3 ready to test, Phase 0 in progress)
+
+================================================================================
+QUICK CONTEXT FOR NEW SESSIONS
+================================================================================
+
+GOAL: Use the DINO neural operator + diffusion framework (dino/ subdir) to
+model our 2D MRI MHD simulation data (from AthenaK, athenak/ subdir).
+
+WHAT'S DONE:
+  - plotting/convert_to_npy.py converts AthenaK binary -> numpy (done, 2.1 GB)
+  - plotting/make_dino_dataset.py creates DINO-format datasets (done, 128x128)
+  - dino/configs/config_diffusion_mri.yaml and config_neurops_mri.yaml written
+  - Data lives on ceph: /mnt/home/mgoldstein/ceph/athenak/feb13/{npy,dino}/
+  - Current dataset: 3 channels (velx, vely, Bx), 96 sliding-window samples,
+    128x128 spatial, 50-timestep windows, 4x super-res for diffusion
+  - simple_diffusion/ standalone flow matching super-res (DINO-independent)
+    - UNet from gf3 (ResBlock+scale-shift, attention, Fourier time emb), ~43M params
+    - Flow matching on all 8 MHD channels at 256x256, 2x super-res
+    - Overfit mode for sanity-checking (single batch, currently being tested)
+
+WHAT'S NEXT:
+  - Phase 0: Verify simple_diffusion overfit test converges, then full training
+  - Phase 3: Test diffusion super-res training (no code changes needed, just run)
+  - Known issue: train/val/test split is contiguous in time, causing amplitude
+    mismatch (MRI growth phase in train, saturated in val/test). Can shuffle later.
+  - Later: neural operator training (Phase 4), MRI PINN loss (Phase 5)
+
+KEY COMMANDS:
+  module load python/3.11.11
+  cd dino && python3 run_training.py --config configs/config_diffusion_mri.yaml
+
+SEE SECTIONS BELOW FOR FULL DETAILS.
+
+================================================================================
+1. PROJECT CONTEXT
+================================================================================
+
+SIMULATION (AthenaK):
+- 2D MRI (Magnetorotational Instability) in a shearing box
+- Resolution: 2048x2048, 4 GPUs (64 meshblocks of 256x256 across 4 ranks)
+- Domain: [-0.5, 0.5] x [-0.5, 0.5], Lx=Ly=1.0
+- Physics: isothermal MHD, cs=1.0, viscosity=1e-4, resistivity=1e-4
+- Shearing box: qshear=1.5, omega0=1.0, beta=4000
+- Time limit: 628.31854 (= 100 orbits, T_orb = 2*pi)
+- Output dt = 0.62831853 (= 0.1 orbits) -> 1001 snapshots (00000..01000)
+- 3 variable groups:
+    mhd_w   -> primitive vars: dens, velx, vely, velz
+    mhd_bcc -> cell-centered B: bcc1, bcc2, bcc3
+    mhd_jz  -> current density: jz
+- Data: /mnt/home/mgoldstein/ceph/athenak/feb13/bin/
+- 4 ranks: rank_00000000..rank_00000003
+
+DINO FRAMEWORK:
+- Hybrid PINO (Physics-Informed Neural Operator) + Conditional Diffusion
+- Originally for 2D INCOMPRESSIBLE MHD with vector potential (u, v, A)
+- Two fully separate training paths controlled by config_type:
+    "diffusion"  -> train_diffusion() [DiffusionDataset, UNet, MSE loss]
+    default      -> train_neural_operator() [MHDDataset, TFNO/FNO, MSE or PINN]
+
+KEY PHYSICS DIFFERENCE:
+- DINO: incompressible, constant density, vector potential A_z
+- MRI: compressible isothermal, shearing box (Coriolis + tidal + shear)
+- This ONLY matters for the PINN loss (deferred)
+- For data-driven training (MSE loss, diffusion), physics doesn't matter
+
+================================================================================
+2. DATA CONVERSION (COMPLETE)
+================================================================================
+
+Script: plotting/convert_to_npy.py
+Completed: 2026-02-15, took ~50 minutes
+
+CONVERTED DATA:
+  /mnt/home/mgoldstein/ceph/athenak/feb13/npy/all_fields_256x256.npy
+    shape: (1001, 256, 256, 8), dtype: float32, size: 2.1 GB
+  /mnt/home/mgoldstein/ceph/athenak/feb13/npy/metadata.npz
+    field_names, times, x_coords, y_coords, sim_params
+
+ALL 8 FIELDS (in order, as stored in the npy):
+  Index  Label     Source       Physical meaning
+  -----  --------  -----------  --------------------------------
+  0      density   mhd_w/dens   Mass density rho
+  1      velx      mhd_w/velx   Radial velocity vx
+  2      vely      mhd_w/vely   Azimuthal velocity vy
+  3      velz      mhd_w/velz   Vertical velocity vz
+  4      Bx        mhd_bcc/bcc1 Radial magnetic field
+  5      By        mhd_bcc/bcc2 Azimuthal magnetic field
+  6      Bz        mhd_bcc/bcc3 Vertical magnetic field
+  7      jz        mhd_jz/jz    Current density (z-component)
+
+FIELD STATISTICS AT EARLY TIME (snapshot 2, t~1.26):
+  density: near 1.0 (std ~1.5e-3)    -- isothermal, nearly uniform
+  velx:    O(1e-4)                     -- MRI perturbations still growing
+  vely:    O(1e-5)                     -- smaller azimuthal perturbation
+  velz:    O(1e-5)                     -- non-zero in 2D (vertical component)
+  Bx:      O(1e-7)                     -- very weak radial B at early time
+  By:      O(1e-2) (sinusoidal)        -- initial net-zero-flux By field
+  Bz:      O(1e-7)                     -- very weak vertical B
+  jz:      O(1e-1)                     -- current from initial By gradient
+
+CONVERSION OPTIONS (for re-running):
+  module load python/3.11.11
+  python3 plotting/convert_to_npy.py --resolution 256  # default
+  python3 plotting/convert_to_npy.py --resolution 512  # higher res
+  python3 plotting/convert_to_npy.py --fields velx,vely,Bx  # subset
+
+================================================================================
+3. DATASET CONSTRUCTION (COMPLETE)
+================================================================================
+
+Script: plotting/make_dino_dataset.py
+Completed: 2026-02-15
+
+CURRENT DATASET (128x128, 3 channels):
+  Created with:
+    python3 plotting/make_dino_dataset.py \
+      --channels velx,vely,Bx \
+      --window 50 --stride 10 \
+      --downsample-factor 4 \
+      --target-resolution 128
+
+  Selected channels (3):
+    Ch 0: velx  (radial velocity)
+    Ch 1: vely  (azimuthal velocity)
+    Ch 2: Bx    (radial magnetic field)
+
+  Why these 3: Matches DINO's default 3-channel setup. velx and vely are the
+  primary dynamical variables for MRI. Bx captures the magnetic field that
+  drives the instability. By could be added as a 4th channel later.
+
+  Sliding window: 96 samples from 1001 snapshots
+    window = 50 timesteps (= 5 orbits each)
+    stride = 10 timesteps (= 1 orbit shift)
+
+  Train/val/test split: CONTIGUOUS (not shuffled)
+    train: 67 samples  (snapshots 0-669, t = 0 to ~42 orbits)
+    val:   14 samples  (snapshots 670-809, t = ~42 to ~51 orbits)
+    test:  15 samples  (snapshots 810-1000, t = ~51 to ~63 orbits)
+
+  KNOWN ISSUE -- AMPLITUDE MISMATCH BETWEEN SPLITS:
+    The MRI grows exponentially from small perturbations, then saturates
+    into turbulence. The contiguous split means:
+      - Training set: covers linear growth AND saturated turbulence
+      - Val/test: mostly saturated regime with smaller amplitudes
+        (val max ~7.8e-3 vs train max ~3.7e-1)
+    This is because the simulation starts with tiny perturbations (O(1e-4))
+    that grow over ~10-20 orbits to saturated turbulence (O(0.1-0.3)).
+    The training set spans the full dynamic range while val/test see only
+    the low-amplitude late-time behavior.
+    FIX: re-run with shuffled windows, or skip the early growth phase
+    (e.g., --snap-start 200), or use a different splitting strategy.
+    For now this is fine for smoke-testing the pipeline.
+
+FILES CREATED:
+  /mnt/home/mgoldstein/ceph/athenak/feb13/dino/
+    neurops_all.npy          (96, 50, 128, 128, 3)    901 MB
+    neurops_train.npy        (67, 50, 128, 128, 3)    629 MB
+    neurops_val.npy          (14, 50, 128, 128, 3)    132 MB
+    neurops_test.npy         (15, 50, 128, 128, 3)    141 MB
+    diffusion_train.npy      dict w/ diff_inputs, diff_targets  1.3 GB
+      inputs:  (67, 3, 50, 128, 128)  <- 4x downsampled then upsampled
+      targets: (67, 3, 50, 128, 128)  <- native 128x128
+    diffusion_val.npy        (14, 3, 50, 128, 128)    263 MB
+    diffusion_test.npy       (15, 3, 50, 128, 128)    282 MB
+    dataset_info.npz         channel_names, window, stride, split info
+    stats/
+      train_neurops_stats.npz
+        mean:    [ 8.0e-07,  3.0e-05, -8.0e-07]
+        std:     [ 1.2e-02,  1.5e-02,  6.1e-03]
+        min_val: [-3.5e-01, -2.4e-01, -1.6e-01]
+        max_val: [ 3.7e-01,  3.1e-01,  1.6e-01]
+      train_diffusion_inputs_stats.npz   (same format, for blurred inputs)
+      train_diffusion_targets_stats.npz  (same format, for hi-res targets)
+
+  Normalization stats format (compatible with DINO):
+    Keys: mean, std, min_val, max_val  -- each shape (C,) = (3,)
+
+RE-GENERATING WITH DIFFERENT CHANNELS:
+  The 256x256 npy has all 8 fields, so regeneration is fast (~minutes):
+    python3 plotting/make_dino_dataset.py \
+      --channels velx,vely,Bx,By \         # 4 channels
+      --target-resolution 128 \
+      --outdir .../dino_4ch
+  Then update config YAML: model_params.channels = 4
+
+  Possible channel selections:
+    3ch: velx, vely, Bx               (current, matches DINO default)
+    4ch: velx, vely, Bx, By           (add azimuthal B)
+    5ch: density, velx, vely, Bx, By  (add compressibility)
+    7ch: density, velx, vely, velz, Bx, By, Bz  (everything but jz)
+    8ch: all fields                    (maximum information)
+
+================================================================================
+4. WHAT NEEDS CODE CHANGES vs. CONFIG-ONLY
+================================================================================
+
+CONFIG-ONLY (no DINO source code edits):
+  - Diffusion model channel count: model_params.channels in YAML
+  - Neural operator channel count: model_params.in_channels, out_channels in YAML
+  - Disabling PINN: loss_params.type = "mse" (or just omit physics-informed)
+  - Image size: model_params.image_size in YAML
+  - Data paths, batch sizes, learning rates, etc.: all YAML
+  - The run_training.py entry point routes to the right training function
+    based on config_type: "diffusion" vs. default
+
+  KEY: Both training paths (diffusion and neural operator) already exist as
+  fully separate, independent codepaths. This is genuinely config-only --
+  no flags to add, no code to comment out. The diffusion path has NEVER
+  had PINN in it. The neural operator path switches between MSE and PINN
+  purely based on loss_params.type in the config YAML.
+
+NO CODE CHANGES NEEDED FOR PHASES 1-3:
+  As long as we:
+  - Prepare data in the expected .npy format/shape
+  - Set channels correctly in config
+  - Set image_size correctly (128 or 256, must be divisible by 2^(len(dim_mults)-1))
+  - Use compatible dim_mults for the chosen image_size
+
+DEFERRED (MRI PINN):
+  - New file: dino/src/physics/mri_pde_solvers.py
+  - New file: dino/src/losses/mri_physics_informed.py
+  - Register the new loss type so it can be selected via config
+
+================================================================================
+5. PHASE PLAN
+================================================================================
+
+PHASE 0: Standalone flow matching super-res [IN PROGRESS]
+  Purpose: DINO-independent sanity check — minimal code, fast iteration.
+  Lives in simple_diffusion/ (not part of DINO framework).
+  [x] Write simple_diffusion/model.py — UNet adapted from gf3/models/mg_unet.py
+      - Configurable channels/resolution, single time embedding, no augmentation
+      - model_channels=128, channel_mult=(1,2,2,2), attention at 64x64
+      - in_channels=16 (8ch xt + 8ch x_lo), out_channels=8, ~43M params
+  [x] Write simple_diffusion/trainer.py — flow matching training + Euler sampling
+      - All 8 MHD fields at 256x256, 2x super-res (avg_pool->bilinear)
+      - Flow matching: linear interpolation, velocity prediction, MSE loss
+      - Overfit flag: trains on single fixed batch for sanity checking
+      - Wandb logging: comparison plots (LR / true HR / generated HR)
+  [x] Write simple_diffusion/README.md
+  [ ] Verify overfit test converges (loss -> 0, samples match ground truth)
+  [ ] Full training run on all 1001 snapshots
+
+PHASE 1: Data pipeline [COMPLETE]
+  [x] Write plotting/convert_to_npy.py
+  [x] Test on 3 snapshots, verify fields + sanity check plot
+  [x] Run on all 1001 snapshots at 256x256 (50 min, 2.1 GB)
+  [x] Quick visualization sanity check (plotting/sanity_check_256.png)
+
+PHASE 2: Dataset creation [COMPLETE]
+  [x] Write plotting/make_dino_dataset.py (with --target-resolution option)
+  [x] Tested on fake data -- output formats verified compatible with DINO
+  [x] Run on real 256x256 data -> 128x128 datasets
+  [x] 96 samples, 67/14/15 train/val/test split
+  [x] Diffusion format with 4x super-res (128->32->128)
+  [x] Neural operator format
+  [x] Normalization stats saved
+
+PHASE 3: Diffusion super-resolution (first ML test) [READY]
+  [x] Write dino/configs/config_diffusion_mri.yaml
+      - config_type: "diffusion"
+      - channels: 3 (velx, vely, Bx)
+      - image_size: 128
+      - Smaller UNet: base_dim=64, dim_mults=[1,2,4,8]
+  [ ] Test training run
+  [ ] Full training run
+  [ ] Evaluate: visual quality, power spectra comparison
+
+PHASE 4: Neural operator forecasting (MSE only)
+  [x] Write dino/configs/config_neurops_mri.yaml
+      - model_type: fno 3d
+      - in_channels: 6 (3 coord grids + 3 fields), out_channels: 3
+      - loss_params.type: "mse"
+  [ ] Train and evaluate
+
+PHASE 5 (later): MRI PINN loss
+  [ ] Implement MRI shearing box PDE residuals
+  [ ] Register as new loss type
+  [ ] Compare PINN vs MSE-only
+
+PHASE 6 (later): Full PINO + Diffusion pipeline
+
+================================================================================
+6. FILES CREATED
+================================================================================
+
+SCRIPTS:
+  plotting/convert_to_npy.py              # bin -> npy converter
+  plotting/make_dino_dataset.py           # npy -> DINO dataset formatter
+  simple_diffusion/model.py               # UNet (from gf3), ~43M params
+  simple_diffusion/trainer.py             # flow matching train/sample/viz
+  simple_diffusion/README.md              # documentation
+
+CONFIGS:
+  dino/configs/config_diffusion_mri.yaml  # diffusion super-res config
+  dino/configs/config_neurops_mri.yaml    # neural operator MSE config
+
+DATA ON CEPH:
+  /mnt/home/mgoldstein/ceph/athenak/feb13/npy/
+    all_fields_256x256.npy                # (1001, 256, 256, 8) 2.1 GB
+    metadata.npz                          # field names, times, coords
+  /mnt/home/mgoldstein/ceph/athenak/feb13/dino/
+    neurops_all.npy                       # (96, 50, 128, 128, 3) 901 MB
+    neurops_{train,val,test}.npy          # per-split
+    diffusion_{train,val,test}.npy        # dict: diff_inputs, diff_targets
+    dataset_info.npz                      # split info, params
+    stats/
+      train_neurops_stats.npz
+      train_diffusion_inputs_stats.npz
+      train_diffusion_targets_stats.npz
+
+DEFERRED:
+  dino/src/physics/mri_pde_solvers.py     # MRI PINN (Phase 5)
+  dino/src/losses/mri_physics_informed.py # MRI loss (Phase 5)
+
+================================================================================
+7. HOW TO RUN
+================================================================================
+
+ENVIRONMENT:
+  module load python/3.11.11   # needed for h5py, scipy, numpy, torch
+
+STEP 1 - Convert simulation data (already done):
+  python3 plotting/convert_to_npy.py --resolution 256
+
+STEP 2 - Create DINO datasets (already done):
+  python3 plotting/make_dino_dataset.py \
+    --channels velx,vely,Bx \
+    --window 50 --stride 10 \
+    --target-resolution 128 \
+    --downsample-factor 4
+
+STEP 3a - Standalone flow matching (simple_diffusion/, DINO-independent):
+  source load.sh
+  python3 simple_diffusion/trainer.py          # set overfit=True for sanity check
+
+STEP 3b - Train diffusion model (DINO framework):
+  cd dino
+  python3 run_training.py --config configs/config_diffusion_mri.yaml
+
+STEP 4 - Train neural operator:
+  cd dino
+  python3 run_training.py --config configs/config_neurops_mri.yaml
+
+================================================================================
+END OF PLAN
+================================================================================
