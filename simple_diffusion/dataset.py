@@ -291,4 +291,71 @@ if __name__ == "__main__":
     for j, name in enumerate(FIELD_NAMES):
         print(f"  {name:<10s} {gap[j].item():.6f}")
 
+    # --- 6. Power spectra: all three views ---
+    print("\nComputing power spectra (averaged over batch)...")
+
+    def radial_power_spectrum(field_2d):
+        """Radially averaged 2D power spectrum. Input: (H, W) numpy array."""
+        N = field_2d.shape[0]
+        fft2 = np.fft.fft2(field_2d)
+        ps2d = np.abs(fft2) ** 2 / N ** 4
+        # Radial binning
+        kx = np.fft.fftfreq(N, d=1.0 / N)
+        ky = np.fft.fftfreq(N, d=1.0 / N)
+        KX, KY = np.meshgrid(kx, ky)
+        K = np.sqrt(KX ** 2 + KY ** 2)
+        k_max = N // 2
+        k_bins = np.arange(1, k_max + 1)
+        ps1d = np.zeros(len(k_bins))
+        for i, k in enumerate(k_bins):
+            mask = (K >= k - 0.5) & (K < k + 0.5)
+            if mask.any():
+                ps1d[i] = ps2d[mask].mean()
+        return k_bins, ps1d
+
+    # Average spectra over the batch for each view
+    show_spec = [1, 4, 7]  # velx, Bx, jz
+    B_size = up_128.shape[0]
+
+    fig, axes = plt.subplots(1, len(show_spec), figsize=(6 * len(show_spec), 5))
+    for col, ch in enumerate(show_spec):
+        ax = axes[col]
+        spectra = {}
+        for label, tensor in [
+            ("up(128)", up_128),
+            ("up(down(256))", up_down_256),
+            ("native 256", x_256_b),
+        ]:
+            ps_sum = None
+            for b in range(B_size):
+                k_bins, ps = radial_power_spectrum(tensor[b, ch].cpu().numpy())
+                if ps_sum is None:
+                    ps_sum = ps
+                else:
+                    ps_sum += ps
+            spectra[label] = (k_bins, ps_sum / B_size)
+
+        colors = {"up(128)": "C0", "up(down(256))": "C1", "native 256": "C2"}
+        styles = {"up(128)": "--", "up(down(256))": "-.", "native 256": "-"}
+        for label, (k, ps) in spectra.items():
+            ax.loglog(k, ps, styles[label], color=colors[label], label=label, lw=1.5)
+
+        # Mark the Nyquist wavenumber for 128 grid
+        ax.axvline(64, color="gray", ls=":", lw=1, alpha=0.7)
+        ax.text(64, ax.get_ylim()[0] * 5, "k=64\n(128 Nyquist)", fontsize=8,
+                ha="center", va="bottom", color="gray")
+
+        ax.set_xlabel("wavenumber k")
+        ax.set_ylabel("P(k)")
+        ax.set_title(FIELD_NAMES[ch])
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+
+    fig.suptitle("Radially averaged power spectra (batch-averaged)", fontsize=14)
+    fig.tight_layout()
+    spec_path = "simple_diffusion/demo_power_spectra.png"
+    fig.savefig(spec_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {spec_path}")
+
     print("\nDone.")
