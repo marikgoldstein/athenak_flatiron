@@ -3,7 +3,7 @@ PLAN: Adapting DINO framework for MRI MHD simulation data
 ================================================================================
 Created: 2026-02-15
 Updated: 2026-02-17
-Status: IN PROGRESS — sim parameter search done, production seeds running,
+Status: IN PROGRESS — seeds 0-99 done + converted to npy, seeds 100-199 running,
         processing pipeline reorganized, Phases 1-2 complete
 
 ================================================================================
@@ -280,12 +280,18 @@ PHASE 1.5: Simulation parameter search [COMPLETE 2026-02-16]
   [x] Input decks: decks/mri2d.athinput.{128,256}
   [x] Launch scripts: toy_sweep.sbatch + toy.sh
 
-PHASE 1.75: Production seed runs [IN PROGRESS 2026-02-17]
+PHASE 1.75: Production seed runs [SEEDS 0-99 COMPLETE, 100-199 RUNNING]
   [x] Launched ~100 seeds at 256x256, nu=eta=3e-5, 1 GPU each
       Location: /mnt/home/mgoldstein/ceph/athenak/mri256_nu3e-5/seed_*/
       Runtime: ~45 min per seed (50 orbits = 314 sim seconds)
-  [ ] Wait for completion
-  [ ] Convert snaps 50-500 to npy (processing/convert_to_npy.py, batch loop)
+  [x] Seeds 0-99 finished
+  [x] Converted seeds 0-99 snaps 0-199 to npy (2026-02-17)
+      Each: (200, 256, 256, 8) float32, ~0.42 GB, ~42 GB total
+      Location: .../seed_NNNN/npy/all_fields_256x256.npy + metadata.npz
+      Ran in parallel batches of 10, ~30s per seed
+  [ ] Seeds 100-199 still running (do not touch)
+  [x] run_128_seeds.sbatch created for 128x128 seeds (nu=eta=3e-5)
+      Output: /mnt/home/mgoldstein/ceph/athenak/mri128_nu3e-5/seed_NNNN/
 
 PHASE 2: Dataset creation [COMPLETE for feb13, NEEDS UPDATE for seeds]
   [x] plotting/make_dino_dataset.py works for single-run data
