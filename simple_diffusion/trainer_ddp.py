@@ -234,7 +234,7 @@ def sde_sample(model, x_lo, num_steps=50, device='cuda',
 
         # Linear anneal: delta at t_min -> delta*noise_scale^2 at t_max
         progress = (t_val - t_min) / (t_max - t_min)
-        delta_t = sde_bse_delta * (1.0 - progress * (1.0 - ns2))
+        delta_t = sde_base_delta * (1.0 - progress * (1.0 - ns2))
         g_t = (2 * delta_t) ** 0.5
 
         score_correction = (delta_t * score).clamp(-1e3, 1e3)
