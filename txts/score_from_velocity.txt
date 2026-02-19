@@ -1,0 +1,83 @@
+Score from Velocity via the Wronskian
+======================================
+
+We use the interpolant  x_t = alpha(t) x_0 + sigma(t) x_1  and learn
+the velocity field  v(t,x) = E[x_dot_t | x_t = x]  where
+x_dot_t = alpha_dot(t) x_0 + sigma_dot(t) x_1.
+
+Goal: express the score  s(t,x) = nabla_x log p_t(x)  in terms of v(t,x)
+without training a separate score model.
+
+
+Step 1:  Recover E[x_0 | x_t] from the velocity
+-------------------------------------------------
+
+At x_t = x we know two conditional expectations:
+
+  E[x_t | x_t = x]       =  x    =  alpha  x_hat_0  +  sigma  x_hat_1
+  E[x_dot_t | x_t = x]   =  v    =  alpha' x_hat_0  +  sigma' x_hat_1
+
+where x_hat_0 = E[x_0 | x_t=x], x_hat_1 = E[x_1 | x_t=x].
+
+This is a 2x2 linear system.  The determinant is the Wronskian:
+
+  D(t) = alpha(t) sigma'(t) - sigma(t) alpha'(t)
+
+(Recall: the Wronskian of two functions f, g is W(f,g) = f g' - f' g.)
+
+By Cramer's rule:
+
+  x_hat_0 = (sigma' x  -  sigma v) / D
+  x_hat_1 = (alpha  v  -  alpha' x) / D
+
+For the linear schedule  alpha = 1-t, sigma = t:
+  D = (1-t)(1) - (t)(-1) = 1
+  x_hat_0 = x - t v
+  x_hat_1 = (1-t) v + x    [not needed below]
+
+
+Step 2:  Score via Tweedie's formula
+--------------------------------------
+
+Suppose x_0 ~ N(mu, sigma_noise^2 I)  independent of x_1.
+(mu = 0 for gaussian base;  mu = x_lo for x_lo_plus_noise base.)
+
+Then conditioned on x_1:
+
+  x_t | x_1  ~  N( alpha mu + sigma x_1,  alpha^2 sigma_noise^2 I )
+
+The score identity  nabla_x log p_t(x) = E[ nabla_x log p(x_t | x_1) | x_t = x ]
+gives:
+
+  s(t,x) = -( x - alpha mu - sigma x_hat_1 ) / ( alpha^2 sigma_noise^2 )
+
+Simplify the numerator using  x = alpha x_hat_0 + sigma x_hat_1 :
+
+  x - alpha mu - sigma x_hat_1  =  alpha (x_hat_0 - mu)
+
+Therefore:
+
+  ┌─────────────────────────────────────────────────┐
+  │                                                 │
+  │   s(t,x) = -( x_hat_0 - mu ) / ( alpha(t) sigma_noise^2 )   │
+  │                                                 │
+  │   where  x_hat_0 = ( sigma'(t) x - sigma(t) v ) / D(t)      │
+  │                                                 │
+  └─────────────────────────────────────────────────┘
+
+  gaussian base:         mu = 0,     sigma_noise = 1
+  x_lo_plus_noise base:  mu = x_lo,  sigma_noise = base_noise_scale
+
+This is what v_to_score() in simple_diffusion/trainer.py computes.
+
+
+Why "Wronskian"?
+----------------
+
+The name comes from the theory of linear ODEs.  If y1, y2 are solutions of a
+second-order linear ODE, their Wronskian W = y1 y2' - y1' y2 measures linear
+independence (W != 0 iff they are independent).  Here alpha(t) and sigma(t)
+play the role of the two basis functions parameterizing the interpolant, and
+D(t) != 0 is the invertibility condition that lets us recover x_hat_0, x_hat_1
+from (x, v).  For any reasonable schedule (alpha(0)=1, sigma(0)=0, alpha(1)=0,
+sigma(1)=1) the Wronskian is positive on (0,1).
