@@ -72,7 +72,9 @@ import argparse
 import copy
 import math
 import os
+import uuid
 from contextlib import nullcontext
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -556,7 +558,7 @@ DEFAULTS = dict(
     seed=42,
     save_most_recent_every=1000,
     save_periodic_every=5000,
-    ckpt_dir="simple_diffusion/checkpoints",
+    ckpt_dir="/mnt/home/mgoldstein/ceph/mri",
 )
 
 
@@ -919,9 +921,14 @@ class Trainer:
                 name=run_name, config=wandb_config,
             )
 
-        # Checkpointing dir (rank 0 creates, then barrier)
+        # Checkpointing dir: base/YYYY-MM-DD_<random>_overfit|full
+        overfit_tag = "overfit" if args.overfit else "full"
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        short_id = uuid.uuid4().hex[:8]
+        self.ckpt_dir = os.path.join(args.ckpt_dir, f"{date_str}_{short_id}_{overfit_tag}")
         if is_main():
-            os.makedirs(args.ckpt_dir, exist_ok=True)
+            os.makedirs(self.ckpt_dir, exist_ok=True)
+            self.print(f"Checkpoints -> {self.ckpt_dir}")
         barrier()
 
     # -- Single training step (with microbatch gradient accumulation) --
@@ -1071,7 +1078,7 @@ class Trainer:
 
     def train(self):
         args = self.args
-        ckpt_dir = args.ckpt_dir
+        ckpt_dir = self.ckpt_dir
 
         # Save init checkpoint
         self.save_ckpt(f"{ckpt_dir}/init.pt", step=0)
@@ -1137,10 +1144,10 @@ class Trainer:
             barrier()  # other ranks wait for rank 0 to finish sampling
 
         if step % args.save_most_recent_every == 0:
-            self.save_ckpt(f"{args.ckpt_dir}/latest.pt", step)
+            self.save_ckpt(f"{self.ckpt_dir}/latest.pt", step)
 
         if step % args.save_periodic_every == 0:
-            self.save_ckpt(f"{args.ckpt_dir}/step_{step:07d}.pt", step)
+            self.save_ckpt(f"{self.ckpt_dir}/step_{step:07d}.pt", step)
             self.print(f"Saved periodic checkpoint at step {step}")
 
 

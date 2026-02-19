@@ -4,7 +4,6 @@ GPUS=1
 set -euo pipefail
 
 cd /mnt/home/mgoldstein/athenak_flatiron
-module load python/3.11.11
 
 # Ensure logs directory exists
 mkdir -p logs
