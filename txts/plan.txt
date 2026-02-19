@@ -3,8 +3,8 @@ PLAN: Adapting DINO framework for MRI MHD simulation data
 ================================================================================
 Created: 2026-02-15
 Updated: 2026-02-17
-Status: IN PROGRESS — seeds 0-99 done + converted to npy, seeds 100-199 running,
-        processing pipeline reorganized, Phases 1-2 complete
+Status: IN PROGRESS — 128+256 seeds 0-99 converted, paired dataloader ready,
+        seeds 100-199 still running, Phases 1-2 complete
 
 ================================================================================
 QUICK CONTEXT FOR NEW SESSIONS
@@ -20,26 +20,28 @@ WHAT'S DONE:
   - Simulation parameter search COMPLETE (see searching_for_sim.txt):
       Winner: nu=eta=3e-5, training window orbits 5-50 (snaps 50-500)
       Smallest domain gap between native 128 and downsampled 256
-  - ~100 production seeds running at 256x256, nu=3e-5, 1 GPU each
-    Location: /mnt/home/mgoldstein/ceph/athenak/mri256_nu3e-5/seed_*/
-    Runtime: ~45 min per seed for 50 orbits
-  - processing/ subdir created for data pipeline (separated from plotting/):
-      processing/convert_to_npy.py   — bin->npy, per-seed, snap range args
-      processing/make_dino_dataset.py — npy->DINO format (copied, not yet updated)
+  - 200 seeds at 256x256 + 100 seeds at 128x128, nu=3e-5
+    Locations: /mnt/home/mgoldstein/ceph/athenak/mri{256,128}_nu3e-5/seed_*/
+  - Seeds 0-99 (both res) fully converted to npy, snaps 0-199 (first 20 orbits)
+    256: (200, 256, 256, 8) ~419 MB each, ~42 GB total
+    128: (200, 128, 128, 8) ~105 MB each, ~10.5 GB total
+  - Paired PyTorch dataloader: simple_diffusion/dataset.py
+      Memory-mapped npy (no 52 GB in RAM)
+      Returns triplet: up(128), native_256, up(down(256))
+      Split by seed (80/10/10), power spectra demo
+  - processing/ subdir for data pipeline (convert_to_npy.py, batch_convert.sh)
   - Old pipeline (plotting/) still works for feb13 2048x2048 data
   - simple_diffusion/ standalone flow matching super-res (DINO-independent)
   - dino/configs/ for diffusion and neural operator configs
 
 WHAT'S NEXT:
-  1. Wait for seed runs to finish (~45 min each)
-  2. Convert seeds to npy: processing/convert_to_npy.py --snap-start 50 --snap-end 500
-     (batch all seeds in parallel, see docstring for shell loop)
-  3. Build super-res dataset from multi-seed data
-     - Input: native 256 downsampled to 128 (or use avg_pool)
-     - Target: native 256
-     - Split by seed (not by time) to avoid leakage
-  4. Train super-res model (simple_diffusion or DINO diffusion)
-  5. Validate on native 128 input at inference
+  1. Train super-res model with simple_diffusion/ on multi-seed data
+     - Training input: up(down(256))   (synthetic low-res from 256)
+     - Target: native 256             (high-res ground truth)
+     - Validate on: up(128)           (native low-res, tests domain gap)
+  2. Monitor domain gap at inference (up(128) vs up(down(256)))
+  3. (Optional) Unpaired 128/256 training signal (same seed, diverged physics)
+  4. Seeds 100-199 at 256 still running (more training data later)
 
 KEY COMMANDS:
   module load python/3.11.11
@@ -280,30 +282,39 @@ PHASE 1.5: Simulation parameter search [COMPLETE 2026-02-16]
   [x] Input decks: decks/mri2d.athinput.{128,256}
   [x] Launch scripts: toy_sweep.sbatch + toy.sh
 
-PHASE 1.75: Production seed runs [SEEDS 0-99 COMPLETE, 100-199 RUNNING]
-  [x] Launched ~100 seeds at 256x256, nu=eta=3e-5, 1 GPU each
+PHASE 1.75: Production seed runs [SEEDS 0-99 COMPLETE + CONVERTED, 100-199 RUNNING]
+  [x] Launched ~200 seeds at 256x256, nu=eta=3e-5, 1 GPU each
       Location: /mnt/home/mgoldstein/ceph/athenak/mri256_nu3e-5/seed_*/
       Runtime: ~45 min per seed (50 orbits = 314 sim seconds)
   [x] Seeds 0-99 finished
   [x] Converted seeds 0-99 snaps 0-199 to npy (2026-02-17)
       Each: (200, 256, 256, 8) float32, ~0.42 GB, ~42 GB total
       Location: .../seed_NNNN/npy/all_fields_256x256.npy + metadata.npz
-      Ran in parallel batches of 10, ~30s per seed
+      Ran in parallel batches of 10, ~35s per batch
   [ ] Seeds 100-199 still running (do not touch)
-  [x] run_128_seeds.sbatch created for 128x128 seeds (nu=eta=3e-5)
-      Output: /mnt/home/mgoldstein/ceph/athenak/mri128_nu3e-5/seed_NNNN/
+  [x] 100 seeds at 128x128, nu=eta=3e-5, 1 GPU each — COMPLETE
+      Location: /mnt/home/mgoldstein/ceph/athenak/mri128_nu3e-5/seed_*/
+  [x] Converted 128 seeds 0-99 snaps 0-199 to npy (2026-02-17)
+      Each: (200, 128, 128, 8) float32, ~0.10 GB, ~10.5 GB total
+      Location: .../seed_NNNN/npy/all_fields_128x128.npy + metadata.npz
+  [x] Conversion script: processing/batch_convert.sh (batches of 10 in parallel)
 
-PHASE 2: Dataset creation [COMPLETE for feb13, NEEDS UPDATE for seeds]
-  [x] plotting/make_dino_dataset.py works for single-run data
-  [ ] Update processing/make_dino_dataset.py for multi-seed super-res:
-      - Aggregate multiple seeds into one dataset
-      - Split by SEED (not time) to avoid leakage
-      - Input: native 256 downsampled to 128
-      - Target: native 256
+PHASE 2: Dataset creation [COMPLETE — paired dataloader in simple_diffusion/]
+  [x] plotting/make_dino_dataset.py works for single-run data (feb13)
+  [x] simple_diffusion/dataset.py — paired PyTorch DataLoader for super-res
+      - MRIPairedDataset: memory-mapped npy, returns (native_128, native_256)
+      - prepare_batch(): GPU-side up/down, returns triplet:
+          up_128:      native 128 upsampled to 256  (inference input)
+          x_256:       native 256                    (target)
+          up_down_256: 256 avg-pooled->128->256      (training input)
+      - make_loaders(): convenience fn, default 80/10/10 seed split
+      - Demo: power spectra, domain gap analysis, comparison figures
+      - Split by SEED to avoid leakage
+  [ ] (Optional) Update processing/make_dino_dataset.py for DINO framework
 
 PHASE 3: Diffusion super-resolution (first ML test) [READY]
   [x] Write dino/configs/config_diffusion_mri.yaml
-  [ ] Test training run (on multi-seed data once ready)
+  [ ] Test training run with simple_diffusion/ on multi-seed data
 
 PHASE 4: Neural operator forecasting (MSE only)
   [x] Write dino/configs/config_neurops_mri.yaml
@@ -319,6 +330,7 @@ PHASE 6 (later): Full PINO + Diffusion pipeline
 
 PROCESSING SCRIPTS (new, multi-seed workflow):
   processing/convert_to_npy.py            # bin -> npy, per-seed, snap range args
+  processing/batch_convert.sh             # batch convert seeds in parallel (10 at a time)
   processing/make_dino_dataset.py         # npy -> DINO format (copied, needs update)
 
 PLOTTING SCRIPTS (original, feb13 data):
@@ -332,6 +344,7 @@ PLOTTING SCRIPTS (original, feb13 data):
 ML CODE:
   simple_diffusion/model.py               # UNet (from gf3), ~43M params
   simple_diffusion/trainer.py             # flow matching train/sample/viz
+  simple_diffusion/dataset.py             # paired DataLoader + prepare_batch
   simple_diffusion/README.md              # documentation
 
 CONFIGS:
@@ -354,10 +367,17 @@ DATA ON CEPH (feb13, 2048x2048, old):
     dataset_info.npz                      # split info, params
     stats/                                # normalization stats
 
-DATA ON CEPH (production seeds, nu=3e-5, IN PROGRESS):
+DATA ON CEPH (production seeds, nu=3e-5):
   /mnt/home/mgoldstein/ceph/athenak/mri256_nu3e-5/seed_*/
-    bin/                                  # raw AthenaK output (running)
-    npy/                                  # to be created after runs finish
+    bin/                                  # raw AthenaK output
+    npy/all_fields_256x256.npy            # (200, 256, 256, 8) snaps 0-199
+    npy/metadata.npz                      # field names, times, coords
+    Seeds 0-99: converted. Seeds 100-199: bins only (still running)
+  /mnt/home/mgoldstein/ceph/athenak/mri128_nu3e-5/seed_*/
+    bin/                                  # raw AthenaK output
+    npy/all_fields_128x128.npy            # (200, 128, 128, 8) snaps 0-199
+    npy/metadata.npz
+    Seeds 0-99: all converted
 
 DEFERRED:
   dino/src/physics/mri_pde_solvers.py     # MRI PINN (Phase 5)
