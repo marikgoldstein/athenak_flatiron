@@ -203,11 +203,16 @@ def euler_sample(model, x_lo, num_steps=50, device='cuda',
 @torch.no_grad()
 def sde_sample(model, x_lo, num_steps=50, device='cuda',
                base_dist="x_lo_plus_noise", base_noise_scale=0.1,
-               t_min=1e-4, t_max=1 - 1e-4, delta=0.1, schedule="linear"):
-    """Euler-Maruyama SDE integration from t_min to t_max."""
+               t_min=1e-4, t_max=1 - 1e-4, sde_base_delta=0.1, schedule="linear"):
+    """Euler-Maruyama SDE integration from t_min to t_max.
+
+    Delta is annealed linearly from `delta` at t_min down to
+    `delta * base_noise_scale**2` at t_max.  This compensates for the
+    1/(alpha * noise_scale**2) divergence of the score near t_max.
+    """
     B = x_lo.shape[0]
     times = make_sample_times(num_steps, t_min, t_max, schedule, device)
-    g = (2 * delta) ** 0.5
+    ns2 = base_noise_scale ** 2  # noise_scale^2 for annealing floor
 
     if base_dist == "gaussian":
         x = torch.randn_like(x_lo)
@@ -220,13 +225,23 @@ def sde_sample(model, x_lo, num_steps=50, device='cuda',
         model_input = torch.cat([x, x_lo], dim=1)
         v = model(t, model_input)
 
-        score = v_to_score(v, x, t_val, x_lo=x_lo,
-                           noise_scale=base_noise_scale, base_dist=base_dist)
+        score = v_to_score(
+            v, x, t_val, 
+            x_lo=x_lo, 
+            noise_scale=base_noise_scale, 
+            base_dist=base_dist
+        )
 
-        drift = v + delta * score
+        # Linear anneal: delta at t_min -> delta*noise_scale^2 at t_max
+        progress = (t_val - t_min) / (t_max - t_min)
+        delta_t = sde_bse_delta * (1.0 - progress * (1.0 - ns2))
+        g_t = (2 * delta_t) ** 0.5
+
+        score_correction = (delta_t * score).clamp(-1e3, 1e3)
+        drift = v + score_correction
         if i < num_steps - 1:
             noise = torch.randn_like(x)
-            x = x + dt * drift + g * dt ** 0.5 * noise
+            x = x + dt * drift + g_t * dt ** 0.5 * noise
         else:
             x = x + dt * drift
 
@@ -577,9 +592,9 @@ DEFAULTS = dict(
     # SAMPLING
     t_min_sample=1e-4,
     t_max_sample=1 - 1e-4,
-    sde_delta=0.1,
+    sde_base_delta=0.01,
     sample_steps=100,
-    sample_schedule="quadratic",
+    sample_schedule="linear",
     # SYSTEM
     use_bf16=True,
     use_compile=True,
@@ -632,7 +647,7 @@ def parse_args():
                         "Set to 0 in overfit mode automatically.")
     p.add_argument("--warmup-steps", type=int, default=DEFAULTS["warmup_steps"])
     p.add_argument("--min-lr", type=float, default=DEFAULTS["min_lr"])
-    p.add_argument("--sde-delta", type=float, default=DEFAULTS["sde_delta"])
+    p.add_argument("--sde-base-delta", type=float, default=DEFAULTS["sde_base_delta"])
     p.add_argument("--num-workers", type=int, default=DEFAULTS["num_workers"])
     p.add_argument("--time-sampler", type=str, default=DEFAULTS["time_sampler"],
                    choices=["uniform", "logit_normal"])
@@ -956,7 +971,7 @@ class Trainer:
                 ema_decay=args.ema_decay, ema_start_step=self.ema_start_step,
                 warmup_steps=self.warmup_steps, min_lr=args.min_lr,
                 force_weight_norm=args.force_weight_norm,
-                use_bf16=args.use_bf16, sde_delta=args.sde_delta,
+                use_bf16=args.use_bf16, sde_base_delta=args.sde_base_delta,
                 overfit=args.overfit, n_params=f"{n_params:.1f}M",
                 channels=self.channel_names, n_channels=self.n_channels,
                 world_size=self.world_size,
@@ -1076,8 +1091,8 @@ class Trainer:
             t_min=args.t_min_sample, t_max=args.t_max_sample,
             schedule=args.sample_schedule,
         )
-        use_sde = args.sde_delta > 0
-        sde_kw = dict(**sample_kwargs, delta=args.sde_delta) if use_sde else {}
+        use_sde = args.sde_base_delta > 0
+        sde_kw = dict(**sample_kwargs, sde_base_delta=args.sde_base_delta) if use_sde else {}
 
         # Train samples
         log_dict, train_msg = generate_sample_logs(
