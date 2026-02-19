@@ -10,7 +10,7 @@
 **/wandb/*
 .venv/*
 
-
+wandb_old_logs
 athenak
 dino
 build_mri2d
