@@ -157,21 +157,41 @@ def v_to_score(v, x, t, x_lo=None, noise_scale=1.0, base_dist="gaussian"):
 # Sampling
 # ---------------------------------------------------------------------------
 
+def make_sample_times(num_steps, t_min, t_max, schedule="linear", device="cuda"):
+    """Build integration time grid.
+
+    Args:
+        schedule: "linear"    -> uniform spacing
+                  "quadratic" -> denser near t_max (data end)
+    Returns:
+        times: (num_steps,) tensor of integration times.
+    """
+    if schedule == "linear":
+        return torch.linspace(t_min, t_max, num_steps, device=device)
+    elif schedule == "quadratic":
+        # u in [0,1] uniform, t = t_min + (t_max - t_min) * u^2
+        # squares concentrate points near t_min; we flip so density is near t_max
+        u = torch.linspace(1.0, 0.0, num_steps, device=device)
+        return t_max - (t_max - t_min) * u ** 2
+    else:
+        raise ValueError(f"Unknown sample schedule: {schedule}")
+
+
 @torch.no_grad()
 def euler_sample(model, x_lo, num_steps=50, device='cuda',
                  base_dist="x_lo_plus_noise", base_noise_scale=0.1,
-                 t_min=1e-4, t_max=1 - 1e-4):
+                 t_min=1e-4, t_max=1 - 1e-4, schedule="linear"):
     """Euler ODE integration from t_min to t_max."""
     B = x_lo.shape[0]
-    times = torch.linspace(t_min, t_max, num_steps, device=device)
-    dt = times[1] - times[0]
+    times = make_sample_times(num_steps, t_min, t_max, schedule, device)
 
     if base_dist == "gaussian":
         x = torch.randn_like(x_lo)
     else:  # x_lo_plus_noise
         x = x_lo + base_noise_scale * torch.randn_like(x_lo)
 
-    for t_val in times:
+    for i, t_val in enumerate(times):
+        dt = times[i + 1] - t_val if i < num_steps - 1 else t_max - t_val
         t = t_val.expand(B)
         model_input = torch.cat([x, x_lo], dim=1)
         v = model(t, model_input)
@@ -183,11 +203,10 @@ def euler_sample(model, x_lo, num_steps=50, device='cuda',
 @torch.no_grad()
 def sde_sample(model, x_lo, num_steps=50, device='cuda',
                base_dist="x_lo_plus_noise", base_noise_scale=0.1,
-               t_min=1e-4, t_max=1 - 1e-4, delta=0.1):
+               t_min=1e-4, t_max=1 - 1e-4, delta=0.1, schedule="linear"):
     """Euler-Maruyama SDE integration from t_min to t_max."""
     B = x_lo.shape[0]
-    times = torch.linspace(t_min, t_max, num_steps, device=device)
-    dt = times[1] - times[0]
+    times = make_sample_times(num_steps, t_min, t_max, schedule, device)
     g = (2 * delta) ** 0.5
 
     if base_dist == "gaussian":
@@ -195,7 +214,8 @@ def sde_sample(model, x_lo, num_steps=50, device='cuda',
     else:  # x_lo_plus_noise
         x = x_lo + base_noise_scale * torch.randn_like(x_lo)
 
-    for t_val in times:
+    for i, t_val in enumerate(times):
+        dt = times[i + 1] - t_val if i < num_steps - 1 else t_max - t_val
         t = t_val.expand(B)
         model_input = torch.cat([x, x_lo], dim=1)
         v = model(t, model_input)
@@ -204,8 +224,11 @@ def sde_sample(model, x_lo, num_steps=50, device='cuda',
                            noise_scale=base_noise_scale, base_dist=base_dist)
 
         drift = v + delta * score
-        noise = torch.randn_like(x)
-        x = x + dt * drift + g * dt ** 0.5 * noise
+        if i < num_steps - 1:
+            noise = torch.randn_like(x)
+            x = x + dt * drift + g * dt ** 0.5 * noise
+        else:
+            x = x + dt * drift
 
     return x
 
@@ -376,7 +399,8 @@ def generate_sample_logs(model, ema_shadow, lo_norm, lo_phys, hi_phys, native_12
     x_hi_gen = denormalize(euler_sample(model, lo_norm, **sample_kwargs), stats)
     x_hi_ema = denormalize(euler_sample(ema_shadow, lo_norm, **sample_kwargs), stats)
     if use_sde:
-        x_hi_sde = denormalize(sde_sample(ema_shadow, lo_norm, **sde_kwargs), stats)
+        x_hi_sde = denormalize(sde_sample(model, lo_norm, **sde_kwargs), stats)
+        x_hi_sde_ema = denormalize(sde_sample(ema_shadow, lo_norm, **sde_kwargs), stats)
 
     # Raw model: comparison + diffs
     comp_rows = [
@@ -389,8 +413,8 @@ def generate_sample_logs(model, ema_shadow, lo_norm, lo_phys, hi_phys, native_12
         ('target - ODE', hi_phys - x_hi_gen),
     ]
     if use_sde:
-        comp_rows.append(('SDE (EMA)', x_hi_sde))
-        diff_rows.append(('target - SDE (EMA)', hi_phys - x_hi_sde))
+        comp_rows.append(('SDE', x_hi_sde))
+        diff_rows.append(('target - SDE', hi_phys - x_hi_sde))
 
     for name, fig in make_comparison_figure(comp_rows, channel_names, show_ch).items():
         log_dict[f'{p}samples/{name}'] = wandb.Image(fig)
@@ -410,8 +434,8 @@ def generate_sample_logs(model, ema_shadow, lo_norm, lo_phys, hi_phys, native_12
         ('target - ODE (EMA)', hi_phys - x_hi_ema),
     ]
     if use_sde:
-        ema_comp_rows.append(('SDE (EMA)', x_hi_sde))
-        ema_diff_rows.append(('target - SDE (EMA)', hi_phys - x_hi_sde))
+        ema_comp_rows.append(('SDE (EMA)', x_hi_sde_ema))
+        ema_diff_rows.append(('target - SDE (EMA)', hi_phys - x_hi_sde_ema))
 
     for name, fig in make_comparison_figure(ema_comp_rows, channel_names, show_ch).items():
         log_dict[f'{p}samples_ema/{name}'] = wandb.Image(fig)
@@ -427,7 +451,8 @@ def generate_sample_logs(model, ema_shadow, lo_norm, lo_phys, hi_phys, native_12
         ("ODE (EMA)", x_hi_ema, "C2", "--"),
     ]
     if use_sde:
-        spectra_list.append(("SDE (EMA)", x_hi_sde, "C4", "-."))
+        spectra_list.append(("SDE", x_hi_sde, "C4", "-."))
+        spectra_list.append(("SDE (EMA)", x_hi_sde_ema, "C5", "-."))
     spectra_list.append(("low resolution (128)", native_128, "C3", "-"))
     spec_fig = make_spectra_figure(spectra_list, channel_names, show_ch)
     log_dict[f'{p}spectra'] = wandb.Image(spec_fig)
@@ -441,8 +466,10 @@ def generate_sample_logs(model, ema_shadow, lo_norm, lo_phys, hi_phys, native_12
     msg = f"mse={mse:.6f}  ema={mse_ema:.6f}"
     if use_sde:
         mse_sde = F.mse_loss(x_hi_sde, hi_phys).item()
+        mse_sde_ema = F.mse_loss(x_hi_sde_ema, hi_phys).item()
         log_dict[f'{p}mse_sde'] = mse_sde
-        msg += f"  sde={mse_sde:.6f}"
+        log_dict[f'{p}mse_sde_ema'] = mse_sde_ema
+        msg += f"  sde={mse_sde:.6f}  sde_ema={mse_sde_ema:.6f}"
     return log_dict, msg
 
 
@@ -523,45 +550,51 @@ def _force_normalize_mpconv_weights(model):
 # ---------------------------------------------------------------------------
 
 DEFAULTS = dict(
+    # OPTIMIZATION
     local_batch_size=4,
     microbatch_size=4,
-    lr=2e-4,
-    weight_decay=0.0,
-    total_steps=200_000,
-    print_every=100,
-    log_every=100,
-    sample_steps=100,
-    base_dist="x_lo_plus_noise",
-    base_noise_scale=0.1,
-    t_min_train=1e-4,
-    t_max_train=1 - 1e-4,
-    t_min_sample=1e-4,
-    t_max_sample=1 - 1e-4,
-    loss_scale=100.0,
-    grad_clip=1.0,
-    ema_decay=0.9999,
-    ema_start_step=10_000,
-    warmup_steps=10_000,
+    base_lr=2e-4,
+    lr_schedule="cosine",
     min_lr=1e-7,
-    force_weight_norm=True,
-    use_bf16=True,
-    use_compile=True,
-    sde_delta=0.1,
-    overfit=True,
-    num_workers=4,
-    channels="velx",
+    grad_clip=1.0,
+    weight_decay=0.0,
+    loss_scale=100.0,
     time_sampler="logit_normal",
     logit_normal_mean=0.0,
     logit_normal_std=1.0,
-    arch_name="edm2",
     dropout=0.1,
+    total_steps=200_000,
+    warmup_steps=10_000,
+    force_weight_norm=True,
+    t_min_train=1e-4,
+    t_max_train=1 - 1e-4,
+    # PROBLEM
+    overfit=True,
+    arch_name="edm2",
+    channels="velx",
+    base_dist="x_lo_plus_noise",
+    base_noise_scale=0.1,
+    # SAMPLING
+    t_min_sample=1e-4,
+    t_max_sample=1 - 1e-4,
+    sde_delta=0.1,
+    sample_steps=100,
+    sample_schedule="quadratic",
+    # SYSTEM
+    use_bf16=True,
+    use_compile=True,
+    num_workers=4,
     seed=42,
+    # LOGGING 
+    log_every=100,
+    sample_every=500,
     save_most_recent_every=1000,
     save_periodic_every=5000,
     ckpt_dir="/mnt/home/mgoldstein/ceph/mri",
+    # EMA 
+    ema_decay=0.9999,
+    ema_start_step=10_000,
 )
-
-
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -573,12 +606,18 @@ def parse_args():
                    default=DEFAULTS["microbatch_size"],
                    help="Samples per fwd/bwd pass; must divide local-batch-size "
                         "(default: same as local-batch-size, i.e. no accumulation)")
-    p.add_argument("--lr", type=float, default=DEFAULTS["lr"])
+    p.add_argument("--base-lr", type=float, default=DEFAULTS["base_lr"])
+    p.add_argument("--lr-schedule", type=str, default=DEFAULTS["lr_schedule"],
+                   choices=["const", "cosine"],
+                   help="LR schedule after warmup: 'const' or 'cosine' (default: cosine)")
     p.add_argument("--weight-decay", type=float, default=DEFAULTS["weight_decay"])
     p.add_argument("--total-steps", type=int, default=DEFAULTS["total_steps"])
-    p.add_argument("--print-every", type=int, default=DEFAULTS["print_every"])
     p.add_argument("--log-every", type=int, default=DEFAULTS["log_every"])
+    p.add_argument("--sample-every", type=int, default=DEFAULTS["sample_every"])
     p.add_argument("--sample-steps", type=int, default=DEFAULTS["sample_steps"])
+    p.add_argument("--sample-schedule", type=str,
+                   default=DEFAULTS["sample_schedule"],
+                   choices=["linear", "quadratic"])
     p.add_argument("--base-dist", type=str, default=DEFAULTS["base_dist"])
     p.add_argument("--base-noise-scale", type=float, default=DEFAULTS["base_noise_scale"])
     p.add_argument("--t-min-train", type=float, default=DEFAULTS["t_min_train"])
@@ -805,15 +844,21 @@ class Trainer:
     def setup_optimizer(self):
         args = self.args
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(), lr=args.lr,
+            self.model.parameters(), lr=args.base_lr,
             weight_decay=args.weight_decay,
         )
         self.warmup_steps = 0 if args.overfit else args.warmup_steps
-        min_ratio = args.min_lr / args.lr
+        min_ratio = args.min_lr / args.base_lr
+        schedule = args.lr_schedule
 
         def lr_lambda(step):
+            # Linear warmup
             if self.warmup_steps > 0 and step < self.warmup_steps:
                 return (step + 1) / self.warmup_steps
+            # After warmup
+            if schedule == "const":
+                return 1.0
+            # cosine decay from base_lr to min_lr
             progress = (step - self.warmup_steps) / max(
                 1, args.total_steps - self.warmup_steps
             )
@@ -897,8 +942,12 @@ class Trainer:
                 microbatch_size=self.microbatch_size,
                 n_microsteps=self.n_microsteps,
                 effective_batch_size=self.effective_batch_size,
-                lr=args.lr, weight_decay=args.weight_decay,
-                total_steps=args.total_steps, sample_steps=args.sample_steps,
+                base_lr=args.base_lr, lr_schedule=args.lr_schedule,
+                weight_decay=args.weight_decay,
+                total_steps=args.total_steps,
+                log_every=args.log_every, sample_every=args.sample_every,
+                sample_steps=args.sample_steps,
+                sample_schedule=args.sample_schedule,
                 base_dist=args.base_dist,
                 base_noise_scale=args.base_noise_scale,
                 t_min_train=args.t_min_train, t_max_train=args.t_max_train,
@@ -1025,6 +1074,7 @@ class Trainer:
             base_dist=args.base_dist,
             base_noise_scale=args.base_noise_scale,
             t_min=args.t_min_sample, t_max=args.t_max_sample,
+            schedule=args.sample_schedule,
         )
         use_sde = args.sde_delta > 0
         sde_kw = dict(**sample_kwargs, delta=args.sde_delta) if use_sde else {}
@@ -1084,6 +1134,10 @@ class Trainer:
         self.save_ckpt(f"{ckpt_dir}/init.pt", step=0)
         self.print(f"Saved init checkpoint to {ckpt_dir}/init.pt")
 
+        # Log samples at step 0 (init spectrum, etc.)
+        self.generate_samples(step=0)
+        barrier()
+
         step = 0
         epoch = 0
 
@@ -1126,7 +1180,7 @@ class Trainer:
         """Periodic printing, wandb logging, sample generation, checkpointing."""
         args = self.args
 
-        if step % args.print_every == 0:
+        if step % args.log_every == 0:
             cur_lr = self.optimizer.param_groups[0]["lr"]
             self.print(
                 f"step {step}/{args.total_steps}  loss={loss:.6f}  "
@@ -1139,7 +1193,7 @@ class Trainer:
                     step=step,
                 )
 
-        if step % args.log_every == 0:
+        if step % args.sample_every == 0:
             self.generate_samples(step)
             barrier()  # other ranks wait for rank 0 to finish sampling
 
@@ -1156,6 +1210,11 @@ class Trainer:
 # ---------------------------------------------------------------------------
 
 def main():
+    
+    # TODO: other things like this?
+    torch.set_float32_matmul_precision('high')
+
+
     args = parse_args()
     rank, local_rank, world_size = setup_distributed()
     trainer = Trainer(args, rank, local_rank, world_size)
