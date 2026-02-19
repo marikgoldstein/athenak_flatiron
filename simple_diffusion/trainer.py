@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import copy
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -30,29 +31,64 @@ from dataset import (
 # ---- Config (defaults, overridable via CLI args) ----
 DEFAULTS = dict(
     batch_size=4,
-    lr=1e-4,
+    lr=2e-4,
+    weight_decay=0.0,
     total_steps=50_000,
     print_every=100,
-    log_every=1000,
-    sample_steps=50,
-    base_dist="gaussian",   # or "x_lo_plus_noise"
+    log_every=100,
+    sample_steps=100,
+    base_dist="x_lo_plus_noise",  # or "gaussian"
+    base_noise_scale=0.1,         # noise scale for x_lo_plus_noise base dist
+    t_min_train=1e-4,             # avoid t=0 during training
+    t_max_train=1 - 1e-4,         # avoid t=1 during training
+    t_min_sample=1e-4,            # start of Euler integration
+    t_max_sample=1 - 1e-4,        # end of Euler integration
+    loss_scale=100.0,             # scale loss to avoid Adam epsilon regime
+    grad_clip=1.0,                # max grad norm (0 = no clipping)
+    ema_decay=0.9999,             # EMA decay rate
+    warmup_steps=10_000,          # linear LR warmup (0 in overfit mode)
+    use_bf16=True,                # bf16 autocast for forward/loss
+    sde_delta=0.1,                # SDE diffusion coeff (0 = no SDE sampling)
     overfit=True,
     num_workers=4,
-    channels=None,          # None = all 8; or e.g. "Bx" / "Bx,jz"
+    channels="velx",              # None = all 8; or e.g. "Bx" / "Bx,jz"
 )
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--channels", type=str, default=DEFAULTS["channels"],
-                   help="Comma-separated field names (default: all 8)")
+                   help="Comma-separated field names (default: velx)")
     p.add_argument("--batch-size", type=int, default=DEFAULTS["batch_size"])
     p.add_argument("--lr", type=float, default=DEFAULTS["lr"])
+    p.add_argument("--weight-decay", type=float, default=DEFAULTS["weight_decay"])
     p.add_argument("--total-steps", type=int, default=DEFAULTS["total_steps"])
     p.add_argument("--print-every", type=int, default=DEFAULTS["print_every"])
     p.add_argument("--log-every", type=int, default=DEFAULTS["log_every"])
     p.add_argument("--sample-steps", type=int, default=DEFAULTS["sample_steps"])
     p.add_argument("--base-dist", type=str, default=DEFAULTS["base_dist"])
+    p.add_argument("--base-noise-scale", type=float, default=DEFAULTS["base_noise_scale"],
+                   help="Noise scale for x_lo_plus_noise base dist (default: 0.1)")
+    p.add_argument("--t-min-train", type=float, default=DEFAULTS["t_min_train"],
+                   help="Min t during training (default: 1e-4)")
+    p.add_argument("--t-max-train", type=float, default=DEFAULTS["t_max_train"],
+                   help="Max t during training (default: 1-1e-4)")
+    p.add_argument("--t-min-sample", type=float, default=DEFAULTS["t_min_sample"],
+                   help="Start t for Euler sampling (default: 1e-4)")
+    p.add_argument("--t-max-sample", type=float, default=DEFAULTS["t_max_sample"],
+                   help="End t for Euler sampling (default: 1-1e-4)")
+    p.add_argument("--loss-scale", type=float, default=DEFAULTS["loss_scale"],
+                   help="Multiply loss before backward (default: 100)")
+    p.add_argument("--grad-clip", type=float, default=DEFAULTS["grad_clip"],
+                   help="Max grad norm for clipping (0=off, default: 1.0)")
+    p.add_argument("--ema-decay", type=float, default=DEFAULTS["ema_decay"],
+                   help="EMA decay rate (default: 0.9999)")
+    p.add_argument("--warmup-steps", type=int, default=DEFAULTS["warmup_steps"],
+                   help="Linear LR warmup steps (default: 10000, 0 in overfit)")
+    p.add_argument("--use-bf16", action="store_true", default=DEFAULTS["use_bf16"])
+    p.add_argument("--no-bf16", dest="use_bf16", action="store_false")
+    p.add_argument("--sde-delta", type=float, default=DEFAULTS["sde_delta"],
+                   help="SDE diffusion coeff delta (0=skip SDE sampling, default: 0.1)")
     p.add_argument("--overfit", action="store_true", default=DEFAULTS["overfit"])
     p.add_argument("--no-overfit", dest="overfit", action="store_false")
     p.add_argument("--num-workers", type=int, default=DEFAULTS["num_workers"])
@@ -62,19 +98,21 @@ def parse_args():
 # ---- Sampling ----
 
 @torch.no_grad()
-def euler_sample(model, x_lo, num_steps=50, device='cuda', base_dist="gaussian"):
-    """Euler ODE integration from t=0 to t=1."""
+def euler_sample(model, x_lo, num_steps=50, device='cuda',
+                 base_dist="x_lo_plus_noise", base_noise_scale=0.1,
+                 t_min=1e-4, t_max=1 - 1e-4):
+    """Euler ODE integration from t_min to t_max."""
     B = x_lo.shape[0]
-    dt = 1.0 / num_steps
+    times = torch.linspace(t_min, t_max, num_steps, device=device)
+    dt = times[1] - times[0]
 
     if base_dist == "gaussian":
         x = torch.randn_like(x_lo)
     else:  # x_lo_plus_noise
-        x = x_lo + torch.randn_like(x_lo)
+        x = x_lo + base_noise_scale * torch.randn_like(x_lo)
 
-    for i in range(num_steps):
-        t_val = i * dt
-        t = torch.full((B,), t_val, device=device)
+    for t_val in times:
+        t = t_val.expand(B)
         model_input = torch.cat([x, x_lo], dim=1)
         v = model(t, model_input)
         x = x + dt * v
@@ -82,36 +120,78 @@ def euler_sample(model, x_lo, num_steps=50, device='cuda', base_dist="gaussian")
     return x
 
 
+@torch.no_grad()
+def sde_sample(model, x_lo, num_steps=50, device='cuda',
+               base_dist="x_lo_plus_noise", base_noise_scale=0.1,
+               t_min=1e-4, t_max=1 - 1e-4, delta=0.1):
+    """Euler-Maruyama SDE integration from t_min to t_max.
+
+    Uses the SDE with matching marginals to the ODE:
+        dx = [v + delta * s] dt + sqrt(2*delta) dW
+
+    where the score s(t,x) is derived from the velocity v(t,x):
+        For x_lo_plus_noise base (x0 ~ N(x_lo, sigma^2 I)):
+            s(t,x) = -(x - t*v - x_lo) / ((1-t) * sigma^2)
+        For gaussian base (x0 ~ N(0, I)):
+            s(t,x) = -(x - t*v) / (1-t)
+    """
+    B = x_lo.shape[0]
+    times = torch.linspace(t_min, t_max, num_steps, device=device)
+    dt = times[1] - times[0]
+    g = (2 * delta) ** 0.5
+
+    if base_dist == "gaussian":
+        x = torch.randn_like(x_lo)
+    else:  # x_lo_plus_noise
+        x = x_lo + base_noise_scale * torch.randn_like(x_lo)
+
+    for t_val in times:
+        t = t_val.expand(B)
+        model_input = torch.cat([x, x_lo], dim=1)
+        v = model(t, model_input)
+
+        # Convert v -> score
+        one_minus_t = (1 - t_val)
+        if base_dist == "gaussian":
+            score = -(x - t_val * v) / one_minus_t
+        else:  # x_lo_plus_noise
+            score = -(x - t_val * v - x_lo) / (one_minus_t * base_noise_scale ** 2)
+
+        drift = v + delta * score
+        noise = torch.randn_like(x)
+        x = x + dt * drift + g * dt ** 0.5 * noise
+
+    return x
+
+
 # ---- Visualization ----
 
-def make_comparison_figure(x_lo, x_hi_true, x_hi_gen, channel_names,
-                           channels_to_show=None, x_lo_128=None):
+def make_comparison_figure(rows, channel_names, channels_to_show=None):
     """
     Create a comparison figure (in physical units, already denormalized).
-    Rows: up(128) / up(down(256)) / native 256 / generated.
-    Columns: samples. One figure per channel.
+
+    Args:
+        rows: list of (label, tensor) tuples. Each tensor is (B, C, H, W).
+        channel_names: list of channel name strings.
+        channels_to_show: which channel indices to plot.
+
+    Returns dict of {channel_name: figure}.
+    Columns = batch samples, rows = the provided (label, tensor) pairs.
     """
     if channels_to_show is None:
         channels_to_show = list(range(len(channel_names)))
 
     figs = {}
-    n_samples = x_lo.shape[0]
-    n_rows = 4 if x_lo_128 is not None else 3
+    n_rows = len(rows)
+    n_samples = rows[0][1].shape[0]
 
     for ch_idx in channels_to_show:
-        fig, axes = plt.subplots(n_rows, n_samples, figsize=(3 * n_samples, 3 * n_rows))
+        fig, axes = plt.subplots(n_rows, n_samples,
+                                 figsize=(3 * n_samples, 3 * n_rows))
         if n_samples == 1:
             axes = axes[:, None]
 
-        row_labels = []
-        tensors = []
-        if x_lo_128 is not None:
-            row_labels.append('up(128) [inference input]')
-            tensors.append(x_lo_128)
-        row_labels += ['up(down(256)) [train input]', 'native 256 [target]', 'generated']
-        tensors += [x_lo, x_hi_true, x_hi_gen]
-
-        for row, (label, data) in enumerate(zip(row_labels, tensors)):
+        for row, (label, data) in enumerate(rows):
             for col in range(n_samples):
                 ax = axes[row, col]
                 img = data[col, ch_idx].cpu().numpy()
@@ -123,6 +203,49 @@ def make_comparison_figure(x_lo, x_hi_true, x_hi_gen, channel_names,
                 ax.set_xticks([])
                 ax.set_yticks([])
         fig.suptitle(f'{channel_names[ch_idx]}', fontsize=14)
+        fig.tight_layout()
+        figs[channel_names[ch_idx]] = fig
+    return figs
+
+
+def make_diff_figure(rows, channel_names, channels_to_show=None):
+    """
+    Difference images (physical units, already denormalized).
+
+    Args:
+        rows: list of (label, diff_tensor) tuples. Each tensor is (B, C, H, W).
+        channel_names: list of channel name strings.
+        channels_to_show: which channel indices to plot.
+
+    Returns dict of {channel_name: figure}.
+    """
+    if channels_to_show is None:
+        channels_to_show = list(range(len(channel_names)))
+
+    figs = {}
+    n_rows = len(rows)
+    n_samples = rows[0][1].shape[0]
+
+    for ch_idx in channels_to_show:
+        fig, axes = plt.subplots(n_rows, n_samples,
+                                 figsize=(3 * n_samples, 3 * n_rows))
+        if n_samples == 1:
+            axes = axes[:, None]
+
+        for row, (label, diff) in enumerate(rows):
+            for col in range(n_samples):
+                ax = axes[row, col]
+                img = diff[col, ch_idx].cpu().numpy()
+                vmax = max(abs(img.min()), abs(img.max()))
+                if vmax == 0:
+                    vmax = 1e-8
+                ax.imshow(img, origin='lower', cmap='RdBu_r',
+                          vmin=-vmax, vmax=vmax, aspect='equal')
+                if col == 0:
+                    ax.set_ylabel(label, fontsize=9)
+                ax.set_xticks([])
+                ax.set_yticks([])
+        fig.suptitle(f'{channel_names[ch_idx]} (differences)', fontsize=14)
         fig.tight_layout()
         figs[channel_names[ch_idx]] = fig
     return figs
@@ -149,13 +272,17 @@ def radial_power_spectrum(field_2d):
     return k_bins, ps1d
 
 
-def make_spectra_figure(tensors_dict, channel_names, channels_to_show=None):
-    """Power spectra comparison. Tensors should be in physical units."""
+def make_spectra_figure(spectra_list, channel_names, channels_to_show=None):
+    """Power spectra comparison. Handles mixed resolutions on same plot.
+
+    Args:
+        spectra_list: list of (label, tensor, color, style) tuples.
+            tensor is (B, C, H, W) — H can differ between entries.
+        channel_names: list of channel name strings.
+        channels_to_show: which channel indices to plot.
+    """
     if channels_to_show is None:
         channels_to_show = list(range(len(channel_names)))
-
-    colors = ["C0", "C1", "C2", "C3", "C4"]
-    styles = ["--", "-.", "-", "-", ":"]
 
     fig, axes = plt.subplots(1, len(channels_to_show),
                              figsize=(6 * len(channels_to_show), 5))
@@ -164,15 +291,13 @@ def make_spectra_figure(tensors_dict, channel_names, channels_to_show=None):
 
     for col, ch in enumerate(channels_to_show):
         ax = axes[col]
-        for i, (label, tensor) in enumerate(tensors_dict.items()):
+        for label, tensor, color, style in spectra_list:
             B = tensor.shape[0]
             ps_sum = None
             for b in range(B):
                 k_bins, ps = radial_power_spectrum(tensor[b, ch].cpu().numpy())
                 ps_sum = ps if ps_sum is None else ps_sum + ps
-            ax.loglog(k_bins, ps_sum / B,
-                      styles[i % len(styles)], color=colors[i % len(colors)],
-                      label=label, lw=1.5)
+            ax.loglog(k_bins, ps_sum / B, style, color=color, label=label, lw=1.5)
 
         ax.axvline(64, color="gray", ls=":", lw=1, alpha=0.7)
         ax.set_xlabel("wavenumber k")
@@ -184,6 +309,23 @@ def make_spectra_figure(tensors_dict, channel_names, channels_to_show=None):
     fig.suptitle("Power spectra", fontsize=14)
     fig.tight_layout()
     return fig
+
+
+# ---- EMA ----
+
+class EMA:
+    """Exponential moving average of model parameters."""
+    def __init__(self, model, decay=0.9999):
+        self.decay = decay
+        self.shadow = copy.deepcopy(model)
+        self.shadow.eval()
+        for p in self.shadow.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        for s, p in zip(self.shadow.parameters(), model.parameters()):
+            s.data.mul_(self.decay).add_(p.data, alpha=1 - self.decay)
 
 
 # ---- Training ----
@@ -238,13 +380,22 @@ def main():
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Model parameters: {n_params:.1f}M")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                    weight_decay=args.weight_decay)
+    ema = EMA(model, decay=args.ema_decay)
+    warmup_steps = 0 if args.overfit else args.warmup_steps
 
     run_name = f'fm_sr_{"overfit" if args.overfit else "full"}_{"_".join(channel_names)}'
 
     wandb_config = dict(
-        batch_size=args.batch_size, lr=args.lr, total_steps=args.total_steps,
-        sample_steps=args.sample_steps, base_dist=args.base_dist,
+        batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
+        total_steps=args.total_steps, sample_steps=args.sample_steps,
+        base_dist=args.base_dist, base_noise_scale=args.base_noise_scale,
+        t_min_train=args.t_min_train, t_max_train=args.t_max_train,
+        t_min_sample=args.t_min_sample, t_max_sample=args.t_max_sample,
+        loss_scale=args.loss_scale, grad_clip=args.grad_clip,
+        ema_decay=args.ema_decay, warmup_steps=warmup_steps,
+        use_bf16=args.use_bf16, sde_delta=args.sde_delta,
         overfit=args.overfit, n_params=f"{n_params:.1f}M",
         channels=channel_names, n_channels=n_channels,
         train_seeds=str(train_seeds[:5]) + "...",
@@ -255,17 +406,16 @@ def main():
     # Grab a fixed batch for visualization (and for overfit mode)
     data_iter = iter(loader)
     x_128_fix, x_256_fix = next(data_iter)
-    up_128_fix, x_256_fix, up_down_256_fix = prepare_batch(x_128_fix, x_256_fix, device)
+    _, x_256_fix, up_down_256_fix = prepare_batch(x_128_fix, x_256_fix, device)
 
     # Keep physical-unit copies for visualization
-    vis_lo_phys = up_down_256_fix[:4]
-    vis_hi_phys = x_256_fix[:4]
-    vis_lo_128_phys = up_128_fix[:4]
+    vis_lo_phys = up_down_256_fix[:4]       # up(down(256)) at 256x256
+    vis_hi_phys = x_256_fix[:4]             # native 256
+    # down(256) at native 128x128 for spectrum (no upsampling)
+    vis_down_128 = F.avg_pool2d(vis_hi_phys, kernel_size=2)
 
     # Normalized copies for model input
     vis_lo_norm = normalize(vis_lo_phys, stats)
-    vis_hi_norm = normalize(vis_hi_phys, stats)
-    vis_lo_128_norm = normalize(vis_lo_128_phys, stats)
 
     if args.overfit:
         fixed_lo = normalize(up_down_256_fix, stats)
@@ -294,26 +444,36 @@ def main():
 
         B = x_lo.shape[0]
 
-        # Flow matching: x1 = x_hi, x0 = noise (or x_lo + noise)
+        # Flow matching: x1 = x_hi, x0 = noise (or x_lo + scaled noise)
         x1 = x_hi
         noise = torch.randn_like(x_hi)
         if args.base_dist == "gaussian":
             x0 = noise
         else:
-            x0 = x_lo + noise
+            x0 = x_lo + args.base_noise_scale * noise
 
-        eps = 1e-4
-        t = torch.rand(B, device=device) * (1 - 2 * eps) + eps
+        t = torch.rand(B, device=device) * (args.t_max_train - args.t_min_train) + args.t_min_train
         t_expand = t[:, None, None, None]
         xt = (1 - t_expand) * x0 + t_expand * x1
         target = x1 - x0  # velocity field
 
         model_input = torch.cat([xt, x_lo], dim=1)  # (B, 2C, H, W)
-        pred = model(t, model_input)
-        loss = F.mse_loss(pred, target)
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=args.use_bf16):
+            pred = model(t, model_input)
+            loss = F.mse_loss(pred, target) * args.loss_scale
         optimizer.zero_grad()
         loss.backward()
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
+        # LR warmup: linear ramp then constant
+        if warmup_steps > 0 and step < warmup_steps:
+            lr_scale = (step + 1) / warmup_steps
+            for pg in optimizer.param_groups:
+                pg['lr'] = args.lr * lr_scale
+
         optimizer.step()
+        ema.update(model)
         step += 1
 
         if step % args.print_every == 0:
@@ -322,54 +482,104 @@ def main():
 
         if step % args.log_every == 0:
             model.eval()
-            # Generate from training input (normalized) then denormalize
-            x_hi_gen_norm = euler_sample(model, vis_lo_norm,
-                                         num_steps=args.sample_steps,
-                                         device=device, base_dist=args.base_dist)
-            x_hi_gen = denormalize(x_hi_gen_norm, stats)
+            sample_kwargs = dict(num_steps=args.sample_steps, device=device,
+                                 base_dist=args.base_dist,
+                                 base_noise_scale=args.base_noise_scale,
+                                 t_min=args.t_min_sample, t_max=args.t_max_sample)
 
-            # Generate from inference input (native 128)
-            x_hi_gen_128_norm = euler_sample(model, vis_lo_128_norm,
-                                              num_steps=args.sample_steps,
-                                              device=device, base_dist=args.base_dist)
-            x_hi_gen_128 = denormalize(x_hi_gen_128_norm, stats)
+            # Generate ODE samples (raw + EMA)
+            x_hi_gen = denormalize(euler_sample(model, vis_lo_norm, **sample_kwargs), stats)
+            x_hi_ema = denormalize(euler_sample(ema.shadow, vis_lo_norm, **sample_kwargs), stats)
 
-            # Comparison figures (physical units)
-            figs = make_comparison_figure(
-                vis_lo_phys, vis_hi_phys, x_hi_gen,
-                channel_names=channel_names,
-                channels_to_show=show_ch,
-                x_lo_128=x_hi_gen_128,
-            )
+            # Generate SDE samples (EMA only) if delta > 0
+            use_sde = args.sde_delta > 0
+            if use_sde:
+                sde_kwargs = dict(**sample_kwargs, delta=args.sde_delta)
+                x_hi_sde = denormalize(sde_sample(ema.shadow, vis_lo_norm, **sde_kwargs), stats)
+
             log_dict = {}
+
+            # --- Build row lists for combined figures ---
+            # Raw model: input / target / ODE / SDE
+            comp_rows = [
+                ('input [up(down(256))]', vis_lo_phys),
+                ('target [native 256]', vis_hi_phys),
+                ('ODE', x_hi_gen),
+            ]
+            diff_rows = [
+                ('target - input', vis_hi_phys - vis_lo_phys),
+                ('target - ODE', vis_hi_phys - x_hi_gen),
+            ]
+            if use_sde:
+                comp_rows.append(('SDE (EMA)', x_hi_sde))
+                diff_rows.append(('target - SDE (EMA)', vis_hi_phys - x_hi_sde))
+
+            figs = make_comparison_figure(comp_rows, channel_names, show_ch)
             for name, fig in figs.items():
                 log_dict[f'samples/{name}'] = wandb.Image(fig)
                 plt.close(fig)
 
-            # Power spectra (physical units)
-            spec_fig = make_spectra_figure({
-                "up(128)": vis_lo_128_phys,
-                "up(down(256))": vis_lo_phys,
-                "native 256": vis_hi_phys,
-                "generated (train)": x_hi_gen,
-                "generated (128)": x_hi_gen_128,
-            }, channel_names=channel_names, channels_to_show=show_ch)
+            diff_figs = make_diff_figure(diff_rows, channel_names, show_ch)
+            for name, fig in diff_figs.items():
+                log_dict[f'diffs/{name}'] = wandb.Image(fig)
+                plt.close(fig)
+
+            # EMA model: input / target / ODE EMA / SDE EMA
+            ema_comp_rows = [
+                ('input [up(down(256))]', vis_lo_phys),
+                ('target [native 256]', vis_hi_phys),
+                ('ODE (EMA)', x_hi_ema),
+            ]
+            ema_diff_rows = [
+                ('target - input', vis_hi_phys - vis_lo_phys),
+                ('target - ODE (EMA)', vis_hi_phys - x_hi_ema),
+            ]
+            if use_sde:
+                ema_comp_rows.append(('SDE (EMA)', x_hi_sde))
+                ema_diff_rows.append(('target - SDE (EMA)', vis_hi_phys - x_hi_sde))
+
+            ema_figs = make_comparison_figure(ema_comp_rows, channel_names, show_ch)
+            for name, fig in ema_figs.items():
+                log_dict[f'samples_ema/{name}'] = wandb.Image(fig)
+                plt.close(fig)
+
+            ema_diff_figs = make_diff_figure(ema_diff_rows, channel_names, show_ch)
+            for name, fig in ema_diff_figs.items():
+                log_dict[f'diffs_ema/{name}'] = wandb.Image(fig)
+                plt.close(fig)
+
+            # Power spectra (all on one plot)
+            spectra_list = [
+                ("truth (256)", vis_hi_phys, "C0", "-"),
+                ("ODE", x_hi_gen, "C1", "--"),
+                ("ODE (EMA)", x_hi_ema, "C2", "--"),
+            ]
+            if use_sde:
+                spectra_list.append(("SDE (EMA)", x_hi_sde, "C4", "-."))
+            spectra_list.append(("low resolution (128)", vis_down_128, "C3", "-"))
+
+            spec_fig = make_spectra_figure(spectra_list, channel_names, show_ch)
             log_dict['spectra'] = wandb.Image(spec_fig)
             plt.close(spec_fig)
 
-            # Domain gap metrics (physical units)
-            gap_train = F.mse_loss(x_hi_gen, vis_hi_phys).item()
-            gap_128 = F.mse_loss(x_hi_gen_128, vis_hi_phys).item()
-            log_dict['val/mse_from_train_input'] = gap_train
-            log_dict['val/mse_from_128_input'] = gap_128
+            # MSE metrics (physical units)
+            mse = F.mse_loss(x_hi_gen, vis_hi_phys).item()
+            mse_ema = F.mse_loss(x_hi_ema, vis_hi_phys).item()
+            log_dict['val/mse'] = mse
+            log_dict['val/mse_ema'] = mse_ema
+            msg = f"  [logged at step {step}]  mse={mse:.6f}  ema={mse_ema:.6f}"
+            if use_sde:
+                mse_sde = F.mse_loss(x_hi_sde, vis_hi_phys).item()
+                log_dict['val/mse_sde'] = mse_sde
+                msg += f"  sde={mse_sde:.6f}"
             wandb.log(log_dict, step=step)
             model.train()
-            print(f"  [logged samples at step {step}]  "
-                  f"mse_train={gap_train:.6f}  mse_128={gap_128:.6f}")
+            print(msg)
 
     # Save final checkpoint
     ckpt = {
         'model_state_dict': model.state_dict(),
+        'ema_state_dict': ema.shadow.state_dict(),
         'stats': stats,
         'channel_names': channel_names,
         'step': step,

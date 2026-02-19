@@ -2,9 +2,9 @@
 PLAN: Adapting DINO framework for MRI MHD simulation data
 ================================================================================
 Created: 2026-02-15
-Updated: 2026-02-17
-Status: IN PROGRESS — 128+256 seeds 0-99 converted, paired dataloader ready,
-        seeds 100-199 still running, Phases 1-2 complete
+Updated: 2026-02-18
+Status: IN PROGRESS — standalone flow matching trainer running overfit tests,
+        optimization tuning, seeds 0-99 converted (128+256), 100-199 running
 
 ================================================================================
 QUICK CONTEXT FOR NEW SESSIONS
@@ -13,8 +13,10 @@ QUICK CONTEXT FOR NEW SESSIONS
 GOAL: Use the DINO neural operator + diffusion framework (dino/ subdir) to
 model our 2D MRI MHD simulation data (from AthenaK, athenak/ subdir).
 
-CURRENT FOCUS: Super-resolution — train on downsampled-256 -> native 256,
-apply at inference to native-128 -> predicted 256.
+CURRENT FOCUS: Standalone flow matching super-res (simple_diffusion/), currently
+doing overfit tests on single-seed single-channel (velx) to verify training
+converges before scaling up. Using only 256 sims: up(down(256)) as input,
+native 256 as target. Native 128 sims reserved for later inference testing.
 
 WHAT'S DONE:
   - Simulation parameter search COMPLETE (see searching_for_sim.txt):
@@ -27,21 +29,34 @@ WHAT'S DONE:
     128: (200, 128, 128, 8) ~105 MB each, ~10.5 GB total
   - Paired PyTorch dataloader: simple_diffusion/dataset.py
       Memory-mapped npy (no 52 GB in RAM)
+      Per-channel normalization (Welford online stats from training data)
+      Channel subsetting (e.g. --channels velx or --channels Bx,jz)
       Returns triplet: up(128), native_256, up(down(256))
       Split by seed (80/10/10), power spectra demo
   - processing/ subdir for data pipeline (convert_to_npy.py, batch_convert.sh)
   - Old pipeline (plotting/) still works for feb13 2048x2048 data
   - simple_diffusion/ standalone flow matching super-res (DINO-independent)
+      Flow matching with ODE + SDE sampling (score derived from velocity)
+      EMA model weights, LR warmup, bf16 autocast, loss scaling, grad clipping
+      Wandb logging: comparison figs, difference figs, power spectra, MSE metrics
+      See simple_diffusion/README.md for full details
   - dino/configs/ for diffusion and neural operator configs
 
-WHAT'S NEXT:
-  1. Train super-res model with simple_diffusion/ on multi-seed data
-     - Training input: up(down(256))   (synthetic low-res from 256)
-     - Target: native 256             (high-res ground truth)
-     - Validate on: up(128)           (native low-res, tests domain gap)
-  2. Monitor domain gap at inference (up(128) vs up(down(256)))
-  3. (Optional) Unpaired 128/256 training signal (same seed, diverged physics)
-  4. Seeds 100-199 at 256 still running (more training data later)
+WHAT'S NEXT (near-term):
+  1. Finish overfit tests (single seed, single channel, ~50k steps)
+  2. Scale to multi-seed full training (80 train / 10 val / 10 test seeds)
+  3. Scale to all 8 channels
+  4. Test inference on native 128 sims (domain gap evaluation)
+  5. Seeds 100-199 at 256 still running (more training data later)
+
+WHAT'S NEXT (longer-term):
+  - 2-stage pipeline: PINN/PINO neural operator -> diffusion (like DINO)
+  - More careful resolution/viscosity selection:
+      Fix res (e.g. 256), increase nu until power spectrum converges.
+      This ensures the high-res simulation is numerically converged.
+  - Evaluate whether 128 and 256 have similar enough physics that a model
+    trained on (up(down(256)), 256) is meaningful when applied to up(128).
+  - (Optional) Unpaired 128/256 training signal (same seed, diverged physics)
 
 KEY COMMANDS:
   module load python/3.11.11
@@ -256,14 +271,29 @@ DEFERRED (MRI PINN):
 5. PHASE PLAN
 ================================================================================
 
-PHASE 0: Standalone flow matching super-res [IN PROGRESS]
+PHASE 0: Standalone flow matching super-res [IN PROGRESS — overfit testing]
   Purpose: DINO-independent sanity check — minimal code, fast iteration.
   Lives in simple_diffusion/ (not part of DINO framework).
   [x] Write simple_diffusion/model.py — UNet adapted from gf3/models/mg_unet.py
-  [x] Write simple_diffusion/trainer.py — flow matching training + Euler sampling
+  [x] Write simple_diffusion/trainer.py — flow matching training + ODE/SDE sampling
+  [x] Write simple_diffusion/dataset.py — paired dataloader + normalization
   [x] Write simple_diffusion/README.md
+  [x] Channel subsetting (--channels velx, default single channel for fast debug)
+  [x] Per-channel normalization (Welford online mean/std)
+  [x] Base distribution: x_lo_plus_noise (x0 = x_lo + sigma*noise, sigma=0.1)
+  [x] SDE sampler: score derived from velocity, no extra training needed
+      s(t,x) = -(x - t*v - x_lo) / ((1-t) * sigma^2)
+      dx = [v + delta*s] dt + sqrt(2*delta) dW, delta=0.1 default
+  [x] EMA model weights (decay=0.9999), samples from both raw + EMA
+  [x] Optimization: AdamW, LR warmup (10k steps, skip in overfit), bf16 autocast,
+      loss scaling (100x), grad clipping (norm 1.0), t_min/t_max for train+sample
+  [x] Wandb viz: comparison figs (ODE+SDE in same plot), difference figs,
+      power spectra (truth/ODE/EMA/SDE/low-res), MSE metrics
+  [x] Power spectra: low-res computed at native 128 (down(256)), not upsampled,
+      to avoid bilinear interpolation artifacts in high-k
   [ ] Verify overfit test converges (loss -> 0, samples match ground truth)
-  [ ] Full training run on multi-seed data (after seeds finish)
+  [ ] Full training run on multi-seed data
+  [ ] Test inference on native 128 sims (domain gap)
 
 PHASE 1: Data pipeline [COMPLETE, REORGANIZED 2026-02-17]
   [x] Original: plotting/convert_to_npy.py (for feb13 2048x2048 data)
@@ -341,11 +371,11 @@ PLOTTING SCRIPTS (original, feb13 data):
   plotting/domain_gap_analysis.py         # domain gap comparison
   plotting/analyze_sweep.py              # turbulence sustainability
 
-ML CODE:
-  simple_diffusion/model.py               # UNet (from gf3), ~43M params
-  simple_diffusion/trainer.py             # flow matching train/sample/viz
-  simple_diffusion/dataset.py             # paired DataLoader + prepare_batch
-  simple_diffusion/README.md              # documentation
+ML CODE (simple_diffusion/):
+  simple_diffusion/model.py               # UNet (from gf3), ~43M (8ch) / ~40M (1ch)
+  simple_diffusion/trainer.py             # flow matching: train, ODE+SDE sample, EMA, viz
+  simple_diffusion/dataset.py             # paired DataLoader, normalize/denormalize, stats
+  simple_diffusion/README.md              # full documentation of method + config
 
 CONFIGS:
   dino/configs/config_diffusion_mri.yaml  # diffusion super-res config
@@ -409,9 +439,20 @@ STEP 2 - Convert seed bins to npy (snaps 50-500):
       --snap-start 50 --snap-end 500 &
   done; wait
 
-STEP 3 - Build super-res dataset (TODO — update make_dino_dataset.py)
+STEP 3 - Train standalone flow matching super-res:
+  source load.sh  # or: module load python/3.11.11
 
-STEP 4 - Train super-res model
+  # Overfit test (single seed, single channel, default):
+  python3 simple_diffusion/trainer.py
+
+  # Custom channel / settings:
+  python3 simple_diffusion/trainer.py --channels Bx --sde-delta 0.2
+
+  # Full training (all channels, multi-seed):
+  python3 simple_diffusion/trainer.py \
+    --channels density,velx,vely,velz,Bx,By,Bz,jz --no-overfit
+
+STEP 4 - (Later) DINO framework training
 
 --- OLD WORKFLOW (feb13 2048x2048 single run) ---
 

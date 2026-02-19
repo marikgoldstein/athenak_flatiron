@@ -187,13 +187,18 @@ Note on "sustained" turbulence:
   followed by slow decay. This is likely intrinsic to 2D. nu=3e-5 just
   decays the slowest, giving us the longest usable training window.
 
-NEXT STEPS:
-  1. Scale up: run ~100 seeds at 256 with nu=eta=3e-5
-     - 24 GPUs available, ~2hr per 256 run -> 100 runs in ~1 day
-     - Only need 256 runs (downsample for 128 input)
-     - Native 128 runs only needed for final validation
-  2. Convert snapshots 50-500 to npy for training
-  3. Build super-res dataset (ds-256 as input, native 256 as target)
+NEXT STEPS (as of 2026-02-18):
+  [DONE] 100 seeds at 256 + 100 seeds at 128, nu=eta=3e-5
+  [DONE] Converted seeds 0-99 (both res), snaps 0-199, to npy
+  [DONE] Built paired dataloader + standalone flow matching trainer
+  [IN PROGRESS] Overfit testing on single seed, single channel (velx)
+  [ ] Full multi-seed training
+  [ ] Test inference on native 128 sims
+  [ ] (Later) More careful resolution convergence study:
+      Fix res (e.g. 256), increase nu, check power spectrum convergence.
+      If spectrum doesn't change with nu, the simulation is converged.
+      Currently using nu=3e-5 which has smallest domain gap but may not
+      be fully converged at 256. Fine for now while setting up pipeline.
 
 ================================================================================
 VIDEOS CREATED

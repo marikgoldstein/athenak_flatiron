@@ -407,41 +407,24 @@ if __name__ == "__main__":
                 ps1d[i] = ps2d[mask].mean()
         return k_bins, ps1d
 
-    # Average spectra over the batch for each view
-    # Also compute spectrum on the raw native 128 (not upsampled) on its own k-axis
+    # Power spectra: truth (256) vs low resolution (down(256) at 128x128)
     show_spec = [1, 4, 7]  # velx, Bx, jz
-    B_size = up_128.shape[0]
+    B_size = x_256_b.shape[0]
+    down_256_b = F.avg_pool2d(x_256_b, kernel_size=2)  # (B, C, 128, 128)
 
     fig, axes = plt.subplots(1, len(show_spec), figsize=(6 * len(show_spec), 5))
     for col, ch in enumerate(show_spec):
         ax = axes[col]
 
-        # 256x256 views: up(128), up(down(256)), native 256
         for label, tensor, color, style in [
-            ("up(128) [256x256]", up_128, "C0", "--"),
-            ("up(down(256))", up_down_256, "C1", "-."),
-            ("native 256", x_256_b, "C2", "-"),
+            ("truth (256)", x_256_b, "C0", "-"),
+            ("low resolution (128)", down_256_b, "C3", "-"),
         ]:
             ps_sum = None
             for b in range(B_size):
                 k_bins, ps = radial_power_spectrum(tensor[b, ch].cpu().numpy())
                 ps_sum = ps if ps_sum is None else ps_sum + ps
             ax.loglog(k_bins, ps_sum / B_size, style, color=color, label=label, lw=1.5)
-
-        # Native 128 on its own k-axis (k=1..64), no upsampling
-        ps_sum_128 = None
-        for b in range(B_size):
-            k_bins_128, ps_128 = radial_power_spectrum(x_128_b[b, ch].cpu().numpy())
-            ps_sum_128 = ps_128 if ps_sum_128 is None else ps_sum_128 + ps_128
-        ax.loglog(k_bins_128, ps_sum_128 / B_size, "-", color="C3", label="native 128 [128x128]", lw=2)
-
-        # Also: down(256) at 128x128 (before re-upsampling)
-        down_256_b = F.avg_pool2d(x_256_b, kernel_size=2)  # (B, C, 128, 128)
-        ps_sum_d256 = None
-        for b in range(B_size):
-            k_bins_d, ps_d = radial_power_spectrum(down_256_b[b, ch].cpu().numpy())
-            ps_sum_d256 = ps_d if ps_sum_d256 is None else ps_sum_d256 + ps_d
-        ax.loglog(k_bins_d, ps_sum_d256 / B_size, ":", color="C4", label="down(256) [128x128]", lw=2)
 
         ax.axvline(64, color="gray", ls=":", lw=1, alpha=0.7)
         ax.text(64, ax.get_ylim()[0] * 5, "k=64\n(128 Nyquist)", fontsize=8,
@@ -450,10 +433,10 @@ if __name__ == "__main__":
         ax.set_xlabel("wavenumber k")
         ax.set_ylabel("P(k)")
         ax.set_title(FIELD_NAMES[ch])
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=9)
         ax.grid(True, alpha=0.3)
 
-    fig.suptitle("Power spectra: native grids vs upsampled", fontsize=14)
+    fig.suptitle("Power spectra: truth vs low resolution", fontsize=14)
     fig.tight_layout()
     spec_path = "simple_diffusion/demo_power_spectra.png"
     fig.savefig(spec_path, dpi=150, bbox_inches="tight")
