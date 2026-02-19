@@ -660,7 +660,7 @@ def main():
         fixed_hi = normalize(x_256_fix, stats)
         print(f"Overfit mode: training on single batch of {fixed_lo.shape[0]} samples")
 
-    # Test vis: model input is up(native_128) — the real deployment scenario
+    # Test vis: held-out seeds, same input type (up(down(256))) as train
     # Only set up when not overfitting; grab a batch then discard the loader
     test_vis = None
     if not args.overfit:
@@ -669,13 +669,13 @@ def main():
         test_tmp = DataLoader(test_ds, batch_size=n_vis, shuffle=True,
                               num_workers=0, pin_memory=True)
         x_128_test, x_256_test = next(iter(test_tmp))
-        up_128_test, x_256_test, _ = prepare_batch(x_128_test, x_256_test, device)
+        _, x_256_test, up_down_256_test = prepare_batch(x_128_test, x_256_test, device)
         test_vis = dict(
-            lo_phys=up_128_test[:n_vis],             # up(native_128) at 256x256
-            hi_phys=x_256_test[:n_vis],              # native 256 from test seed
-            native_128=x_128_test[:n_vis].to(device), # native 128x128 for spectrum
-            lo_norm=normalize(up_128_test[:n_vis], stats),
-            input_label="up(native 128)",
+            lo_phys=up_down_256_test[:n_vis],            # up(down(256)) at 256x256
+            hi_phys=x_256_test[:n_vis],                  # native 256 from test seed
+            native_128=F.avg_pool2d(x_256_test[:n_vis], kernel_size=2),  # down(256) for spectrum
+            lo_norm=normalize(up_down_256_test[:n_vis], stats),
+            input_label="up(down(256))",
         )
         del test_tmp, test_ds
         print(f"Test vis: {len(test_seeds[:3])} seeds, {n_vis} samples")
