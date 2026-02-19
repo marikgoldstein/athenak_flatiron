@@ -623,8 +623,8 @@ def parse_args():
                         "(default: same as local-batch-size, i.e. no accumulation)")
     p.add_argument("--base-lr", type=float, default=DEFAULTS["base_lr"])
     p.add_argument("--lr-schedule", type=str, default=DEFAULTS["lr_schedule"],
-                   choices=["const", "cosine"],
-                   help="LR schedule after warmup: 'const' or 'cosine' (default: cosine)")
+                   choices=["const", "cosine", "sqrt"],
+                   help="LR schedule after warmup: 'const', 'cosine', or 'sqrt' (default: cosine)")
     p.add_argument("--weight-decay", type=float, default=DEFAULTS["weight_decay"])
     p.add_argument("--total-steps", type=int, default=DEFAULTS["total_steps"])
     p.add_argument("--log-every", type=int, default=DEFAULTS["log_every"])
@@ -873,10 +873,14 @@ class Trainer:
             # After warmup
             if schedule == "const":
                 return 1.0
+            post = step - self.warmup_steps
+            remaining = max(1, args.total_steps - self.warmup_steps)
+            if schedule == "sqrt":
+                # EDM2-style: constant until decay_ref, then 1/sqrt(t/decay_ref)
+                decay_ref = remaining // 4
+                return 1.0 / math.sqrt(max(post / decay_ref, 1.0))
             # cosine decay from base_lr to min_lr
-            progress = (step - self.warmup_steps) / max(
-                1, args.total_steps - self.warmup_steps
-            )
+            progress = post / remaining
             cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
             return min_ratio + (1.0 - min_ratio) * cosine
 
