@@ -580,6 +580,9 @@ def main():
     channel_names = loader.dataset.channel_names
     print(f"Using {n_channels} channels: {channel_names}")
 
+    # Overfit mode: force no dropout, no warmup (warmup handled below)
+    dropout = 0.0 if args.overfit else args.dropout
+
     # Model — in_channels = 2*C (xt + x_lo concat), out_channels = C
     if args.model == "unet":
         model = UNetModel(
@@ -590,7 +593,7 @@ def main():
             channel_mult=(1, 2, 2, 2),
             attention_resolutions=(4,),     # attention at ds=4 (64x64)
             num_res_blocks=2,
-            dropout=args.dropout,
+            dropout=dropout,
             num_heads=4,
             num_head_channels=64,
         ).to(device)
@@ -603,7 +606,7 @@ def main():
             channel_mult=[1, 2, 2, 2],
             num_blocks=2,
             attn_resolutions=[64],          # attention at 64x64 spatial res
-            dropout=args.dropout,
+            dropout=dropout,
         ).to(device)
     else:
         raise ValueError(f"Unknown model: {args.model}")
@@ -633,7 +636,7 @@ def main():
         num_train_seeds=len(train_seeds),
         save_most_recent_every=args.save_most_recent_every,
         save_periodic_every=args.save_periodic_every,
-        model=args.model, dropout=args.dropout, seed=args.seed,
+        model=args.model, dropout=dropout, seed=args.seed,
         time_sampler=args.time_sampler,
         logit_normal_mean=args.logit_normal_mean,
         logit_normal_std=args.logit_normal_std,

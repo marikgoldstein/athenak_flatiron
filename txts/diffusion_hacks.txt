@@ -1,0 +1,83 @@
+Diffusion / Flow-Matching Training Hacks
+=========================================
+Notes on potential improvements for the flow-matching super-res trainer.
+
+STATUS: [x] = implemented, [ ] = not yet
+
+----------------------------------------------------------------------
+1. Min-LR cosine decay  [x]
+----------------------------------------------------------------------
+Cosine LR schedule decays to --min-lr (default 1e-7) instead of 0.
+Avoids wasting late-training steps at near-zero learning rate.
+Implemented in trainer_ddp.py setup_optimizer().
+
+----------------------------------------------------------------------
+2. EMA delayed start  [x]
+----------------------------------------------------------------------
+--ema-start-step (default 10000). EMA tracking is skipped until this
+step, at which point the current model is fully copied into the EMA
+shadow. Avoids polluting EMA with the random early-training weights.
+In overfit mode, EMA starts immediately (step 0).
+Implemented in trainer_ddp.py (EMA.copy_in, train_step).
+
+----------------------------------------------------------------------
+3. EDM2 forced weight normalization  [x]
+----------------------------------------------------------------------
+--force-weight-norm flag. After each optimizer step, all MPConv weight
+parameters are projected back to unit norm (per-filter). This is the
+"outside the network" normalization from the EDM2 paper (Karras et al.
+2024), complementing the "inside the network" normalization that MPConv
+already does in its forward pass. Only applies when --arch_name edm2.
+Implemented in trainer_ddp.py (_force_normalize_mpconv_weights, train_step).
+
+----------------------------------------------------------------------
+4. Min-SNR / timestep-dependent loss weighting  [ ]
+----------------------------------------------------------------------
+Weight the loss by min(SNR(t), gamma) / SNR(t)  (Hang et al. 2023).
+Focuses training on the harder intermediate timesteps instead of
+wasting capacity on the easy t~0 and t~1 endpoints. Alternatively,
+a simpler approach: weight by 1/max(SNR(t), gamma). Big improvement
+for relatively little code. gamma=5 is a common default.
+
+----------------------------------------------------------------------
+5. Self-conditioning  [ ]
+----------------------------------------------------------------------
+With probability p=0.5 during training:
+  1. Run model with zeroed self-cond input -> get prediction
+  2. Detach prediction
+  3. Re-run model with prediction as extra input channel
+At inference, each ODE step feeds the previous prediction back in.
+Cheap (~50% more compute per step) and consistently helps quality.
+Reference: Analog Bits (Chen et al. 2022), Recurrent Flow (Bansal et al.).
+
+----------------------------------------------------------------------
+6. Classifier-free guidance (CFG)  [ ]
+----------------------------------------------------------------------
+During training: randomly zero out the low-res conditioning input with
+probability p_uncond (e.g. 0.1).
+At inference: pred = (1+w)*pred_cond - w*pred_uncond, with guidance
+scale w > 0 (typically 1-4).
+Single biggest lever for sample sharpness. Need to tune w carefully
+to avoid hallucinating spurious MHD features that aren't in the data.
+
+----------------------------------------------------------------------
+7. EMA decay warmup  [ ]
+----------------------------------------------------------------------
+Ramp EMA decay from a lower value (e.g. 0.99) up to the target
+(e.g. 0.9999) over early training. Early model checkpoints change
+fast and high decay just tracks noise. Karras EDM2 has a formula:
+  ema_decay(step) = min(target_decay, (1 + step/half_life)^(-1))
+Currently we use delayed start instead (hack #2), which is simpler
+but more aggressive. Could combine both approaches.
+
+----------------------------------------------------------------------
+8. Spectral / frequency-domain loss  [ ]
+----------------------------------------------------------------------
+Add a loss term in Fourier space, e.g. MSE on log-amplitude of 2D FFT.
+Helps the model reproduce the high-k power spectrum tail that pixel-
+space MSE tends to blur. Particularly relevant for turbulence data
+where we care about the power spectrum shape. Could weight by k to
+emphasize high frequencies. Straightforward to implement:
+  fft_pred = torch.fft.rfft2(pred)
+  fft_targ = torch.fft.rfft2(target)
+  spectral_loss = F.mse_loss(fft_pred.abs().log(), fft_targ.abs().log())
