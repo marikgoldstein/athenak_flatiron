@@ -1,0 +1,52 @@
+# Overfit config — single-batch sanity check
+# Usage: torchrun ... trainer_ddp.py --config configs/overfit.yaml
+
+# OPTIMIZATION
+local_batch_size: 4
+microbatch_size: 4
+base_lr: 2e-4
+lr_schedule: sqrt
+min_lr: 1e-7
+grad_clip: 1.0
+weight_decay: 0.0
+loss_scale: 100.0
+time_sampler: logit_normal
+logit_normal_mean: 0.0
+logit_normal_std: 1.0
+dropout: 0.1
+total_steps: 200_000
+warmup_steps: 10_000
+force_weight_norm: true
+t_min_train: 1e-4
+t_max_train: 0.9999
+
+# PROBLEM
+overfit: true
+arch_name: edm2
+channels: velx
+base_dist: x_lo_plus_noise
+base_noise_scale: 0.1
+
+# SAMPLING
+t_min_sample: 1e-4
+t_max_sample: 0.9999
+sde_base_delta: 0.001
+sample_steps: 100
+sample_schedule: linear
+
+# SYSTEM
+use_bf16: true
+use_compile: true
+num_workers: 4
+seed: 42
+
+# LOGGING
+log_every: 100
+sample_every: 500
+save_most_recent_every: 1000
+save_periodic_every: 5000
+ckpt_dir: /mnt/home/mgoldstein/ceph/mri
+
+# EMA
+ema_decay: 0.9999
+ema_start_step: 10_000

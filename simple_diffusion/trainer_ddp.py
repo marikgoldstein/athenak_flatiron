@@ -75,6 +75,9 @@ import os
 import uuid
 from contextlib import nullcontext
 from datetime import datetime
+from pathlib import Path
+
+import yaml
 
 import numpy as np
 import torch
@@ -564,119 +567,29 @@ def _force_normalize_mpconv_weights(model):
 # Config
 # ---------------------------------------------------------------------------
 
-DEFAULTS = dict(
-    # OPTIMIZATION
-    local_batch_size=4,
-    microbatch_size=4,
-    base_lr=2e-4,
-    lr_schedule="cosine",
-    min_lr=1e-7,
-    grad_clip=1.0,
-    weight_decay=0.0,
-    loss_scale=100.0,
-    time_sampler="logit_normal",
-    logit_normal_mean=0.0,
-    logit_normal_std=1.0,
-    dropout=0.1,
-    total_steps=200_000,
-    warmup_steps=10_000,
-    force_weight_norm=True,
-    t_min_train=1e-4,
-    t_max_train=1 - 1e-4,
-    # PROBLEM
-    overfit=True,
-    arch_name="edm2",
-    channels="velx",
-    base_dist="x_lo_plus_noise",
-    base_noise_scale=0.1,
-    # SAMPLING
-    t_min_sample=1e-4,
-    t_max_sample=1 - 1e-4,
-    sde_base_delta=0.01,
-    sample_steps=100,
-    sample_schedule="linear",
-    # SYSTEM
-    use_bf16=True,
-    use_compile=True,
-    num_workers=4,
-    seed=42,
-    # LOGGING 
-    log_every=100,
-    sample_every=500,
-    save_most_recent_every=1000,
-    save_periodic_every=5000,
-    ckpt_dir="/mnt/home/mgoldstein/ceph/mri",
-    # EMA 
-    ema_decay=0.9999,
-    ema_start_step=10_000,
-)
+_CONFIG_DIR = Path(__file__).resolve().parent / "configs"
+_DEFAULT_CONFIG = _CONFIG_DIR / "overfit.yaml"
+
+
+def _load_yaml(path):
+    with open(path) as f:
+        return yaml.safe_load(f)
+
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--channels", type=str, default=DEFAULTS["channels"])
-    p.add_argument("--local-batch-size", type=int,
-                   default=DEFAULTS["local_batch_size"],
-                   help="Samples per GPU per optimizer step (default: 4)")
-    p.add_argument("--microbatch-size", type=int,
-                   default=DEFAULTS["microbatch_size"],
-                   help="Samples per fwd/bwd pass; must divide local-batch-size "
-                        "(default: same as local-batch-size, i.e. no accumulation)")
-    p.add_argument("--base-lr", type=float, default=DEFAULTS["base_lr"])
-    p.add_argument("--lr-schedule", type=str, default=DEFAULTS["lr_schedule"],
-                   choices=["const", "cosine", "sqrt"],
-                   help="LR schedule after warmup: 'const', 'cosine', or 'sqrt' (default: cosine)")
-    p.add_argument("--weight-decay", type=float, default=DEFAULTS["weight_decay"])
-    p.add_argument("--total-steps", type=int, default=DEFAULTS["total_steps"])
-    p.add_argument("--log-every", type=int, default=DEFAULTS["log_every"])
-    p.add_argument("--sample-every", type=int, default=DEFAULTS["sample_every"])
-    p.add_argument("--sample-steps", type=int, default=DEFAULTS["sample_steps"])
-    p.add_argument("--sample-schedule", type=str,
-                   default=DEFAULTS["sample_schedule"],
-                   choices=["linear", "quadratic"])
-    p.add_argument("--base-dist", type=str, default=DEFAULTS["base_dist"])
-    p.add_argument("--base-noise-scale", type=float, default=DEFAULTS["base_noise_scale"])
-    p.add_argument("--t-min-train", type=float, default=DEFAULTS["t_min_train"])
-    p.add_argument("--t-max-train", type=float, default=DEFAULTS["t_max_train"])
-    p.add_argument("--t-min-sample", type=float, default=DEFAULTS["t_min_sample"])
-    p.add_argument("--t-max-sample", type=float, default=DEFAULTS["t_max_sample"])
-    p.add_argument("--loss-scale", type=float, default=DEFAULTS["loss_scale"])
-    p.add_argument("--grad-clip", type=float, default=DEFAULTS["grad_clip"])
-    p.add_argument("--ema-decay", type=float, default=DEFAULTS["ema_decay"])
-    p.add_argument("--ema-start-step", type=int, default=DEFAULTS["ema_start_step"],
-                   help="Step at which to start EMA tracking (full copy-in at this step). "
-                        "Set to 0 in overfit mode automatically.")
-    p.add_argument("--warmup-steps", type=int, default=DEFAULTS["warmup_steps"])
-    p.add_argument("--min-lr", type=float, default=DEFAULTS["min_lr"])
-    p.add_argument("--sde-base-delta", type=float, default=DEFAULTS["sde_base_delta"])
-    p.add_argument("--num-workers", type=int, default=DEFAULTS["num_workers"])
-    p.add_argument("--time-sampler", type=str, default=DEFAULTS["time_sampler"],
-                   choices=["uniform", "logit_normal"])
-    p.add_argument("--logit-normal-mean", type=float,
-                   default=DEFAULTS["logit_normal_mean"])
-    p.add_argument("--logit-normal-std", type=float,
-                   default=DEFAULTS["logit_normal_std"])
-    p.add_argument("--arch_name", type=str, default=DEFAULTS["arch_name"],
-                   choices=["unet", "edm2"])
-    p.add_argument("--dropout", type=float, default=DEFAULTS["dropout"])
-    p.add_argument("--seed", type=int, default=DEFAULTS["seed"])
-    p.add_argument("--save-most-recent-every", type=int,
-                   default=DEFAULTS["save_most_recent_every"])
-    p.add_argument("--save-periodic-every", type=int,
-                   default=DEFAULTS["save_periodic_every"])
-    p.add_argument("--ckpt-dir", type=str, default=DEFAULTS["ckpt_dir"])
-    
-    
-    p.add_argument("--overfit", action="store_true", default=DEFAULTS["overfit"])
-    p.add_argument("--no-overfit", dest="overfit", action="store_false")
-    p.add_argument("--use-bf16", action="store_true", default=DEFAULTS["use_bf16"])
-    p.add_argument("--no-bf16", dest="use_bf16", action="store_false")
-    p.add_argument("--use-compile", action="store_true", default=DEFAULTS["use_compile"])
-    p.add_argument("--no-compile", dest="use_compile", action="store_false")
-    p.add_argument("--force-weight-norm", action="store_true",
-                   default=DEFAULTS["force_weight_norm"])
-    p.add_argument("--no-force-weight-norm", dest="force_weight_norm",
-                   action="store_false")
-    return p.parse_args()
+    p.add_argument("--config", type=str, default=str(_DEFAULT_CONFIG),
+                   help="Path to YAML config file (default: configs/overfit.yaml)")
+    p.add_argument("--resume-from", type=str, default=None,
+                   help="Path to checkpoint directory to resume from")
+    args = p.parse_args()
+
+    # Load everything else from YAML
+    cfg = _load_yaml(args.config)
+    for key, value in cfg.items():
+        setattr(args, key, value)
+
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -844,7 +757,7 @@ class Trainer:
             self.model = DDP(
                 model, device_ids=[self.local_rank],
                 find_unused_parameters=False,
-                static_graph=True,
+                static_graph=False,
                 gradient_as_bucket_view=True,
             )
             self.model_without_ddp = self.model.module
@@ -900,6 +813,7 @@ class Trainer:
 
     def setup_logging(self):
         args = self.args
+
         n_vis = 4
 
         # Grab a fixed batch for visualization
@@ -961,7 +875,8 @@ class Trainer:
                 microbatch_size=self.microbatch_size,
                 n_microsteps=self.n_microsteps,
                 effective_batch_size=self.effective_batch_size,
-                base_lr=args.base_lr, lr_schedule=args.lr_schedule,
+                base_lr=args.base_lr, 
+                lr_schedule=args.lr_schedule,
                 weight_decay=args.weight_decay,
                 total_steps=args.total_steps,
                 log_every=args.log_every, sample_every=args.sample_every,
